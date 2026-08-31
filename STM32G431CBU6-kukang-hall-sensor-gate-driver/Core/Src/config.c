@@ -71,7 +71,13 @@ void Config_LoadDefaults(void) {
   motor_config.verbose_output = 1;       // Enable GUI telemetry by default
   motor_config.verbose_period = 10;      // 10ms (100Hz) high-speed telemetry
   motor_config.open_loop_voltage = 2.0f; // 2.0V safe voltage
-  motor_config.accel_limit = 50.0f; // Default 50 rad/s^2 acceleration limit
+  motor_config.accel_limit = 100.0f;
+  motor_config.switchover_rpm = 50.0f;
+  motor_config.switchover_delay = 8.0f;
+  motor_config.hall_offset_deg = 90.0f;
+  motor_config.vel_kp = 0.05f;
+  motor_config.vel_ki = 0.1f;
+  motor_config.accel_rpm_s = 500.0f;
 
   memset(motor_config.reserved, 0, sizeof(motor_config.reserved));
 }
@@ -161,6 +167,37 @@ void Config_PrintAll(void) {
   cdc_printf("$5=%lu (Verbose Period ms)\r\n", motor_config.verbose_period);
   cdc_printf("$6=%d.%02d (Open Loop Voltage V)\r\n", olv_i, olv_f);
   cdc_printf("$7=%d.%02d (Accel Limit rad/s^2)\r\n", acc_i, acc_f);
+  
+  int srm_i = (int)motor_config.switchover_rpm,
+      srm_f = (int)(motor_config.switchover_rpm * 100) % 100;
+  if (srm_f < 0) srm_f = -srm_f;
+  cdc_printf("$8=%d.%02d (Switchover RPM)\r\n", srm_i, srm_f);
+  
+  int sdelay_i = (int)motor_config.switchover_delay,
+      sdelay_f = (int)(motor_config.switchover_delay * 100) % 100;
+  if (sdelay_f < 0) sdelay_f = -sdelay_f;
+  cdc_printf("$9=%d.%02d (Switchover Delay sec)\r\n", sdelay_i, sdelay_f);
+  
+  int hoff_i = (int)motor_config.hall_offset_deg,
+      hoff_f = (int)(motor_config.hall_offset_deg * 100) % 100;
+  if (hoff_f < 0) hoff_f = -hoff_f;
+  cdc_printf("$10=%d.%02d (Hall Offset Deg)\r\n", hoff_i, hoff_f);
+
+  int vkp_i = (int)motor_config.vel_kp,
+      vkp_f = (int)(motor_config.vel_kp * 1000) % 1000;
+  if (vkp_f < 0) vkp_f = -vkp_f;
+  cdc_printf("$11=%d.%03d (Velocity Kp)\r\n", vkp_i, vkp_f);
+  
+  int vki_i = (int)motor_config.vel_ki,
+      vki_f = (int)(motor_config.vel_ki * 1000) % 1000;
+  if (vki_f < 0) vki_f = -vki_f;
+  cdc_printf("$12=%d.%03d (Velocity Ki)\r\n", vki_i, vki_f);
+  
+  int arpms_i = (int)motor_config.accel_rpm_s,
+      arpms_f = (int)(motor_config.accel_rpm_s * 10) % 10;
+  if (arpms_f < 0) arpms_f = -arpms_f;
+  cdc_printf("$13=%d.%d (Accel RPM/s)\r\n", arpms_i, arpms_f);
+
   cdc_printf("ok\r\n");
 }
 
@@ -206,6 +243,12 @@ void Config_ParseCommand(char *cmd_line) {
         case 5: motor_config.verbose_period = atoi(val_str); break;
         case 6: motor_config.open_loop_voltage = atof(val_str); break;
         case 7: motor_config.accel_limit = atof(val_str); break;
+        case 8: motor_config.switchover_rpm = atof(val_str); break;
+        case 9: motor_config.switchover_delay = atof(val_str); break;
+        case 10: motor_config.hall_offset_deg = atof(val_str); break;
+        case 11: motor_config.vel_kp = atof(val_str); break;
+        case 12: motor_config.vel_ki = atof(val_str); break;
+        case 13: motor_config.accel_rpm_s = atof(val_str); break;
         default:
           cdc_printf("error: Invalid parameter\r\n");
           return;
@@ -218,7 +261,7 @@ void Config_ParseCommand(char *cmd_line) {
     }
   } else if (cmd_line[0] == 'S' || cmd_line[0] == 's') {
     float target = atof(&cmd_line[1]);
-    SixStep_SetSpeed(target);
+    SixStep_SetRPM(target);
     cdc_printf("ok\r\n");
   } else if (cmd_line[0] == 'T' || cmd_line[0] == 't') {
     SixStep_Stop();

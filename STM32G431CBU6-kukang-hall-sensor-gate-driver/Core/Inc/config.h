@@ -25,6 +25,12 @@ typedef struct {
     float open_loop_voltage;     // $6: Voltage for Open Loop Mode
     
     float accel_limit;           // $7: Acceleration Limit (rad/s^2), 0 = no limit
+    float switchover_rpm;        // $8: Switchover RPM from 6-step to SVPWM
+    float switchover_delay;      // $9: Switchover Delay in seconds
+    float hall_offset_deg;       // $10: Hall Offset in Degrees
+    float vel_kp;                // $11: Velocity Proportional Gain
+    float vel_ki;                // $12: Velocity Integral Gain
+    float accel_rpm_s;           // $13: Acceleration Limit (RPM/s)
     
     // Future expansion space
     uint32_t reserved[8];

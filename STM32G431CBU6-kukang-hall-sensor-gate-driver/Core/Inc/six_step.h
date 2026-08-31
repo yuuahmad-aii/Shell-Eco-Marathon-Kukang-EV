@@ -8,10 +8,10 @@
 void SixStep_Init(void);
 
 // Update the commutation based on Hall sensors. Call this in while(1) loop.
-void SixStep_Update(void);
+void SixStep_Update(float dt);
 
 // Set speed (0.0 to 100.0)
-void SixStep_SetSpeed(float target_duty);
+void SixStep_SetRPM(float target_rpm);
 
 // Stop the motor immediately (coast)
 void SixStep_Stop(void);

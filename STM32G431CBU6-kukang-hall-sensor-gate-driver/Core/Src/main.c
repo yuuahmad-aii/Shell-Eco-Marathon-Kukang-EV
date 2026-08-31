@@ -151,7 +151,13 @@ int main(void)
   Config_ApplyPWMFrequency();
   SixStep_Init();
 
+  // Enable DWT Cycle Counter for timing
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
   uint32_t last_verbose_time = HAL_GetTick();
+  uint32_t last_cycle_count = DWT->CYCCNT;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -161,7 +167,15 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    SixStep_Update();
+    uint32_t current_time = DWT->CYCCNT;
+    uint32_t cycle_diff = current_time - last_cycle_count;
+    
+    // Limit control loop to ~20kHz to prevent float precision issues with very small dt
+    if (cycle_diff >= (SystemCoreClock / 20000)) {
+        last_cycle_count = current_time;
+        float dt = (float)cycle_diff / (float)SystemCoreClock;
+        SixStep_Update(dt);
+    }
 
     Parse_USB_Command();
 

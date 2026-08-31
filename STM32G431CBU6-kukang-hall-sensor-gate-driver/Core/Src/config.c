@@ -1,5 +1,5 @@
 #include "config.h"
-#include "open_loop.h"
+#include "six_step.h"
 #include "main.h"
 #include "usbd_cdc_if.h"
 #include <math.h>
@@ -170,7 +170,7 @@ void Config_PrintHelp(void) {
   cdc_printf("$x=y    : Set parameter x to value y\r\n");
   cdc_printf("$save   : Save settings to flash\r\n");
   cdc_printf("$h      : Show this help\r\n");
-  cdc_printf("S<val>  : Set Target Velocity (Rad/s)\r\n");
+  cdc_printf("S<val>  : Set Target Duty Cycle (%)\r\n");
   cdc_printf("T       : Stop Motor\r\n");
   cdc_printf("ok\r\n");
 }
@@ -218,10 +218,10 @@ void Config_ParseCommand(char *cmd_line) {
     }
   } else if (cmd_line[0] == 'S' || cmd_line[0] == 's') {
     float target = atof(&cmd_line[1]);
-    OpenLoop_SetTarget(target);
+    SixStep_SetSpeed(target);
     cdc_printf("ok\r\n");
   } else if (cmd_line[0] == 'T' || cmd_line[0] == 't') {
-    OpenLoop_SetTarget(0.0f);
+    SixStep_Stop();
     cdc_printf("Motor Stopped\r\n");
   } else {
     cdc_printf("error: Unknown command\r\n");

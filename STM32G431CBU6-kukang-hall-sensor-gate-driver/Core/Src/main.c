@@ -23,7 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "config.h"
-#include "open_loop.h"
+#include "six_step.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -149,23 +149,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
   Config_Init();
   Config_ApplyPWMFrequency();
-  OpenLoop_Init();
-
-  // Start PWM and Complementary PWM
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
-
-  // Enable DWT Cycle Counter for timing
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  DWT->CYCCNT = 0;
-  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  SixStep_Init();
 
   uint32_t last_verbose_time = HAL_GetTick();
-  uint32_t last_cycle_count = DWT->CYCCNT;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -175,26 +161,14 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    uint32_t current_time = DWT->CYCCNT;
-    uint32_t cycle_diff = current_time - last_cycle_count;
-    last_cycle_count = current_time;
-    float dt = (float)cycle_diff / (float)SystemCoreClock;
-    if (dt <= 0.000001f) {
-      dt = 0.00005f; // Fallback to 20kHz nominal dt
-    }
-
-    OpenLoop_Update(dt);
+    SixStep_Update();
 
     Parse_USB_Command();
 
     if (motor_config.verbose_output == 1) {
       if (HAL_GetTick() - last_verbose_time >= motor_config.verbose_period) {
         last_verbose_time = HAL_GetTick();
-        
-        // Send telemetry (actual speed, target, voltage, etc)
-        Telemetry_SendBinary(open_loop.mechanical_angle, open_loop.shaft_velocity, 
-                             open_loop.v_q, open_loop.target_velocity, 
-                             open_loop.u_a, open_loop.u_b, open_loop.u_c, 3);
+        SixStep_PrintVerbose();
       }
     }
   }

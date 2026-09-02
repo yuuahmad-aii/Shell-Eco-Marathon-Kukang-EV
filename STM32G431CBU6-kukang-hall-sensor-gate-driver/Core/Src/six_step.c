@@ -16,6 +16,7 @@ static uint8_t motor_running = 0;
 static uint8_t last_hall_state = 0;
 
 static uint8_t Get_Hall_State(void);
+static int8_t Get_Hall_Direction(uint8_t current, uint8_t previous);
 
 static float electrical_velocity = 0.0f; 
 static float time_since_hall = 0.0f;
@@ -75,19 +76,35 @@ void SixStep_Init(void) {
 }
 
 void SixStep_SetRPM(float setpoint_rpm) {
-    if (setpoint_rpm < 0.0f) setpoint_rpm = 0.0f; // Limit to positive for now
-    
     target_rpm = setpoint_rpm;
     
-    if (target_rpm > 5.0f) {
+    if (fabsf(target_rpm) > 5.0f) {
         if (!motor_running) {
+            // --- BOOTSTRAP PRE-CHARGE FOR IR2110 ---
+            // Set 0% duty (HIN=0, LIN=1) and enable all phases
+            htim1.Instance->CCR1 = 0;
+            htim1.Instance->CCR2 = 0;
+            htim1.Instance->CCR3 = 0;
+            ENABLE_PHASE_U();
+            ENABLE_PHASE_V();
+            ENABLE_PHASE_W();
+            
+            // Wait 5ms to fully charge bootstrap capacitors
+            HAL_Delay(5);
+            
+            // Disable phases before starting commutation
+            DISABLE_PHASE_U();
+            DISABLE_PHASE_V();
+            DISABLE_PHASE_W();
+            // ---------------------------------------
+
             last_hall_state = Get_Hall_State();
             electrical_velocity = 0.0f;
             time_since_hall = 0.0f;
             time_running = 0.0f;
             ramped_rpm = 0.0f;
-            vel_integral = 10.0f; // Pre-load integral slightly to give initial kick
-            current_duty = 10.0f;
+            vel_integral = (target_rpm > 0.0f) ? 10.0f : -10.0f; // Pre-load integral slightly to give initial kick
+            current_duty = (target_rpm > 0.0f) ? 10.0f : -10.0f;
         }
         motor_running = 1;
     } else {
@@ -121,6 +138,19 @@ static uint8_t Get_Hall_State(void) {
     return state;
 }
 
+static int8_t Get_Hall_Direction(uint8_t current, uint8_t previous) {
+    if (current == previous) return 0;
+    switch (previous) {
+        case 5: return (current == 1) ? 1 : ((current == 4) ? -1 : 0);
+        case 1: return (current == 3) ? 1 : ((current == 5) ? -1 : 0);
+        case 3: return (current == 2) ? 1 : ((current == 1) ? -1 : 0);
+        case 2: return (current == 6) ? 1 : ((current == 3) ? -1 : 0);
+        case 6: return (current == 4) ? 1 : ((current == 2) ? -1 : 0);
+        case 4: return (current == 5) ? 1 : ((current == 6) ? -1 : 0);
+        default: return 0;
+    }
+}
+
 static void SVPWM(float v_alpha, float v_beta, float *t_a, float *t_b, float *t_c) {
     float v_a = v_alpha;
     float v_b = -0.5f * v_alpha + 0.86602540378f * v_beta;
@@ -134,13 +164,13 @@ static void SVPWM(float v_alpha, float v_beta, float *t_a, float *t_b, float *t_
     *t_b = v_b + v_com + 0.5f;
     *t_c = v_c + v_com + 0.5f;
 
-    if (*t_a > 1.0f) *t_a = 1.0f; 
+    if (*t_a > 0.95f) *t_a = 0.95f; // Limit to 95% for bootstrap recharge
     if (*t_a < 0.0f) *t_a = 0.0f;
     
-    if (*t_b > 1.0f) *t_b = 1.0f; 
+    if (*t_b > 0.95f) *t_b = 0.95f; 
     if (*t_b < 0.0f) *t_b = 0.0f;
     
-    if (*t_c > 1.0f) *t_c = 1.0f; 
+    if (*t_c > 0.95f) *t_c = 0.95f; 
     if (*t_c < 0.0f) *t_c = 0.0f;
 }
 
@@ -166,7 +196,8 @@ void SixStep_Update(float dt) {
     
     if (hall_state != last_hall_state) {
         if (last_hall_state != 0 && time_since_hall > 0.0001f) {
-            float inst_vel = (M_PI / 3.0f) / time_since_hall;
+            int8_t dir = Get_Hall_Direction(hall_state, last_hall_state);
+            float inst_vel = dir * (M_PI / 3.0f) / time_since_hall;
             // Simple low pass filter
             electrical_velocity = 0.2f * inst_vel + 0.8f * electrical_velocity;
         }
@@ -180,7 +211,15 @@ void SixStep_Update(float dt) {
 
     // Calculate expected angle based on Hall sensors
     float hall_offset = motor_config.hall_offset_deg * M_PI / 180.0f;
-    float expected_angle = hall_angles[hall_state] + hall_offset + (electrical_velocity * time_since_hall);
+    float expected_angle = hall_angles[hall_state] + hall_offset;
+    
+    // hall_angles stores the forward entry edge. For reverse, the entry edge is 60 degrees ahead.
+    if (ramped_rpm < 0.0f) {
+        expected_angle += (M_PI / 3.0f);
+    }
+    
+    expected_angle += (electrical_velocity * time_since_hall);
+    
     while (expected_angle > 2.0f * M_PI) expected_angle -= 2.0f * M_PI;
     while (expected_angle < 0.0f) expected_angle += 2.0f * M_PI;
 
@@ -210,9 +249,9 @@ void SixStep_Update(float dt) {
 
     // Hysteresis for mode switching
     uint8_t next_svpwm_mode = svpwm_mode;
-    if (time_running > motor_config.switchover_delay && electrical_velocity > switchover_velocity && current_duty > 5.0f) {
+    if (time_running > motor_config.switchover_delay && fabsf(electrical_velocity) > switchover_velocity && fabsf(current_duty) > 5.0f) {
         next_svpwm_mode = 1;
-    } else if (electrical_velocity < (switchover_velocity - 15.0f)) {
+    } else if (fabsf(electrical_velocity) < (switchover_velocity - 15.0f)) {
         next_svpwm_mode = 0;
     }
     
@@ -236,18 +275,20 @@ void SixStep_Update(float dt) {
     vel_integral += rpm_error * motor_config.vel_ki * dt;
     
     // Anti-windup
-    if (vel_integral > 100.0f) vel_integral = 100.0f;
-    if (vel_integral < 0.0f) vel_integral = 0.0f;
+    float max_duty = 95.0f; // Limit max duty for IR2110 bootstrap recharge
+    if (vel_integral > max_duty) vel_integral = max_duty;
+    if (vel_integral < -max_duty) vel_integral = -max_duty;
 
     float pi_out = (rpm_error * motor_config.vel_kp) + vel_integral;
-    if (pi_out > 100.0f) pi_out = 100.0f;
-    if (pi_out < 0.0f) pi_out = 0.0f;
+    
+    if (pi_out > max_duty) pi_out = max_duty;
+    if (pi_out < -max_duty) pi_out = -max_duty;
     
     current_duty = pi_out;
     // ------------------------------
 
     uint32_t arr = htim1.Instance->ARR;
-    uint32_t ccr_val = (uint32_t)((current_duty / 100.0f) * arr);
+    uint32_t ccr_val = (uint32_t)((fabsf(current_duty) / 100.0f) * arr);
 
     if (svpwm_mode) {
         ENABLE_PHASE_U();
@@ -265,8 +306,20 @@ void SixStep_Update(float dt) {
         htim1.Instance->CCR2 = (uint32_t)(tb * arr);
         htim1.Instance->CCR3 = (uint32_t)(tc * arr);
     } else {
+        uint8_t comm_state = hall_state;
+        if (current_duty < 0.0f) {
+            // Reverse commutation by shifting 180 electrical degrees (3 states)
+            switch (comm_state) {
+                case 5: comm_state = 2; break;
+                case 1: comm_state = 6; break;
+                case 3: comm_state = 4; break;
+                case 2: comm_state = 5; break;
+                case 6: comm_state = 1; break;
+                case 4: comm_state = 3; break;
+            }
+        }
         // 6-step block commutation
-        switch (hall_state) {
+        switch (comm_state) {
             case 5:
                 DISABLE_PHASE_W();
                 htim1.Instance->CCR1 = ccr_val;

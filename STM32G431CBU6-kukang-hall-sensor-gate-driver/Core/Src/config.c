@@ -78,6 +78,7 @@ void Config_LoadDefaults(void) {
   motor_config.vel_kp = 0.05f;
   motor_config.vel_ki = 0.1f;
   motor_config.accel_rpm_s = 500.0f;
+  motor_config.invert_direction = 0;
 
   memset(motor_config.reserved, 0, sizeof(motor_config.reserved));
 }
@@ -197,6 +198,8 @@ void Config_PrintAll(void) {
       arpms_f = (int)(motor_config.accel_rpm_s * 10) % 10;
   if (arpms_f < 0) arpms_f = -arpms_f;
   cdc_printf("$13=%d.%d (Accel RPM/s)\r\n", arpms_i, arpms_f);
+  
+  cdc_printf("$14=%lu (Invert Direction: 0=Normal, 1=Inverted)\r\n", motor_config.invert_direction);
 
   cdc_printf("ok\r\n");
 }
@@ -249,6 +252,7 @@ void Config_ParseCommand(char *cmd_line) {
         case 11: motor_config.vel_kp = atof(val_str); break;
         case 12: motor_config.vel_ki = atof(val_str); break;
         case 13: motor_config.accel_rpm_s = atof(val_str); break;
+        case 14: motor_config.invert_direction = atoi(val_str); break;
         default:
           cdc_printf("error: Invalid parameter\r\n");
           return;
@@ -260,9 +264,24 @@ void Config_ParseCommand(char *cmd_line) {
       }
     }
   } else if (cmd_line[0] == 'S' || cmd_line[0] == 's') {
-    float target = atof(&cmd_line[1]);
-    SixStep_SetRPM(target);
-    cdc_printf("ok\r\n");
+    float original_target = atof(&cmd_line[1]);
+    float actual_target = original_target;
+    if (motor_config.invert_direction) {
+        actual_target = -actual_target;
+    }
+    SixStep_SetRPM(actual_target);
+    
+    int rpm_i = (int)original_target;
+    int rpm_f = (int)(original_target * 10) % 10;
+    if (rpm_f < 0) rpm_f = -rpm_f;
+    
+    if (original_target > 0.0f) {
+        cdc_printf("ok: Motor berputar MAJU pada %d.%d RPM\r\n", rpm_i, rpm_f);
+    } else if (original_target < 0.0f) {
+        cdc_printf("ok: Motor berputar MUNDUR pada %d.%d RPM\r\n", -rpm_i, rpm_f);
+    } else {
+        cdc_printf("ok: Motor berhenti\r\n");
+    }
   } else if (cmd_line[0] == 'T' || cmd_line[0] == 't') {
     SixStep_Stop();
     cdc_printf("Motor Stopped\r\n");

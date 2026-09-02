@@ -31,9 +31,10 @@ typedef struct {
     float vel_kp;                // $11: Velocity Proportional Gain
     float vel_ki;                // $12: Velocity Integral Gain
     float accel_rpm_s;           // $13: Acceleration Limit (RPM/s)
+    uint32_t invert_direction;   // $14: Invert Motor Direction (0=Normal, 1=Inverted)
     
     // Future expansion space
-    uint32_t reserved[8];
+    uint32_t reserved[7];
 } motor_config_t;
 
 extern motor_config_t motor_config;

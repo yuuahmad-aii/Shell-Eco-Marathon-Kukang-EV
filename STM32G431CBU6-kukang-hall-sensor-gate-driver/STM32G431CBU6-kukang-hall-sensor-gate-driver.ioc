@@ -2,10 +2,12 @@
 CAD.formats=
 CAD.pinconfig=
 CAD.provider=
-FDCAN1.CalculateBaudRateNominal=2999999
-FDCAN1.CalculateTimeBitNominal=333
-FDCAN1.CalculateTimeQuantumNominal=111.11111111111111
-FDCAN1.IPParameters=CalculateTimeQuantumNominal,CalculateTimeBitNominal,CalculateBaudRateNominal
+FDCAN1.CalculateBaudRateNominal=500000
+FDCAN1.CalculateTimeBitNominal=2000
+FDCAN1.CalculateTimeQuantumNominal=500.0
+FDCAN1.IPParameters=CalculateTimeQuantumNominal,CalculateTimeBitNominal,CalculateBaudRateNominal,NominalPrescaler,NominalTimeSeg1
+FDCAN1.NominalPrescaler=72
+FDCAN1.NominalTimeSeg1=2
 File.Version=6
 GPIO.groupedBy=Group By Peripherals
 KeepUserPlacement=false

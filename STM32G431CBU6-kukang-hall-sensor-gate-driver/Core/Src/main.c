@@ -78,6 +78,32 @@ void Parse_USB_Command(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+FDCAN_RxHeaderTypeDef RxHeader;
+uint8_t RxData[8];
+
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
+{
+  if((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET)
+  {
+    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    
+    if (RxHeader.Identifier == 0x10)
+    {
+       uint8_t run_state = RxData[0];
+       uint16_t target_rpm = RxData[1] | (RxData[2] << 8);
+       
+       if (run_state == 1) {
+           SixStep_SetRPM((float)target_rpm);
+       } else {
+           SixStep_Stop();
+       }
+    }
+  }
+}
+
 void Process_USB_Receive(uint8_t *Buf, uint32_t Len) {
   for (uint32_t i = 0; i < Len; i++) {
     if (usb_rx_index < sizeof(usb_rx_buffer) - 1) {
@@ -147,6 +173,29 @@ int main(void)
   MX_CORDIC_Init();
   MX_FMAC_Init();
   /* USER CODE BEGIN 2 */
+  FDCAN_FilterTypeDef sFilterConfig;
+  sFilterConfig.IdType = FDCAN_STANDARD_ID;
+  sFilterConfig.FilterIndex = 0;
+  sFilterConfig.FilterType = FDCAN_FILTER_MASK;
+  sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+  sFilterConfig.FilterID1 = 0x000;
+  sFilterConfig.FilterID2 = 0x000;
+  
+  if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
   Config_Init();
   Config_ApplyPWMFrequency();
   SixStep_Init();
@@ -282,9 +331,9 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.AutoRetransmission = DISABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
-  hfdcan1.Init.NominalPrescaler = 16;
+  hfdcan1.Init.NominalPrescaler = 72;
   hfdcan1.Init.NominalSyncJumpWidth = 1;
-  hfdcan1.Init.NominalTimeSeg1 = 1;
+  hfdcan1.Init.NominalTimeSeg1 = 2;
   hfdcan1.Init.NominalTimeSeg2 = 1;
   hfdcan1.Init.DataPrescaler = 1;
   hfdcan1.Init.DataSyncJumpWidth = 1;

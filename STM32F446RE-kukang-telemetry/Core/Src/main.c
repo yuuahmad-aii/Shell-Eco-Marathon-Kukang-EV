@@ -244,6 +244,7 @@ int main(void)
 #pragma pack(pop)
 
   uint8_t is_logging = 0;
+  uint8_t sd_error = 0;
   uint32_t log_start_time = 0;
 
   uint32_t last_ui_tick = 0;
@@ -290,6 +291,7 @@ int main(void)
         FRESULT w_res = f_write(&SDFile, &log_entry, sizeof(LogData), &bytes_written);
         if (w_res != FR_OK || bytes_written == 0) {
             CLI_Print("Log err: write %d. Recovering SD...\r\n", w_res);
+            sd_error = 1;
             
             // Auto Recovery Mechanism
             f_close(&SDFile);
@@ -298,6 +300,7 @@ int main(void)
             if (f_mount(&SDFatFS, SDPath, 1) == FR_OK) {
                 if (f_open(&SDFile, current_filename, FA_OPEN_APPEND | FA_WRITE) == FR_OK) {
                     CLI_Print("SD Recovered!\r\n");
+                    sd_error = 0;
                 } else {
                     is_logging = 0; // Fatal error, stop logging
                     CLI_Print("SD Recovery failed\r\n");
@@ -314,12 +317,14 @@ int main(void)
           FRESULT s_res = f_sync(&SDFile);
           if (s_res != FR_OK) {
               CLI_Print("Log err: sync %d. Recovering SD...\r\n", s_res);
+              sd_error = 1;
               // Same recovery logic for sync
               f_close(&SDFile);
               f_mount(NULL, SDPath, 1);
               if (f_mount(&SDFatFS, SDPath, 1) == FR_OK) {
                   if (f_open(&SDFile, current_filename, FA_OPEN_APPEND | FA_WRITE) == FR_OK) {
                       CLI_Print("SD Recovered!\r\n");
+                      sd_error = 0;
                   } else {
                       is_logging = 0;
                   }
@@ -369,10 +374,11 @@ int main(void)
         }
       }
       if ((buttons & 0x08) && !(prev_buttons & 0x08)) { // S4: Logging
-        if (is_logging) {
+        if (is_logging || sd_error) {
           f_close(&SDFile);
           is_logging = 0;
-          CLI_Print("Log stopped\r\n");
+          sd_error = 0;
+          CLI_Print("Log stopped / Err cleared\r\n");
         } else {
           FRESULT mount_res = f_mount(&SDFatFS, SDPath, 1);
           if (mount_res == FR_OK) {
@@ -382,6 +388,7 @@ int main(void)
               FRESULT open_res = f_open(&SDFile, current_filename, FA_CREATE_NEW | FA_WRITE);
               if (open_res == FR_OK) {
                 is_logging = 1;
+                sd_error = 0;
                 log_start_time = HAL_GetTick();
                 last_log_tick = log_start_time; // Reset log tick
                 CLI_Print("Log started: %s\r\n", current_filename);
@@ -389,9 +396,13 @@ int main(void)
               }
               file_index++;
             }
-            if (file_index >= 1000) CLI_Print("Log err: index full\r\n");
+            if (file_index >= 1000) {
+              CLI_Print("Log err: index full\r\n");
+              sd_error = 1;
+            }
           } else {
             CLI_Print("Log err: mount %d\r\n", mount_res);
+            sd_error = 1;
           }
         }
       }
@@ -459,9 +470,11 @@ int main(void)
       break;
     }
 
-      if (is_logging) {
+      if (sd_error) {
+        led_mask |= 0x80; // Solid LED 8 on error
+      } else if (is_logging) {
         if ((current_tick / 500) % 2) {
-          led_mask |= 0x80; // Blink LED 8
+          led_mask |= 0x80; // Blink LED 8 on logging
         }
       }
 

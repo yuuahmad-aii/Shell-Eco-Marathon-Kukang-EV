@@ -47,6 +47,12 @@
           <apexchart type="line" height="200" :options="gyroOptions" :series="gyroSeries"></apexchart>
         </div>
 
+        <!-- Speed -->
+        <div class="chart-card">
+          <div class="chart-title">Vehicle Speed (km/h)</div>
+          <apexchart type="line" height="200" :options="speedOptions" :series="speedSeries"></apexchart>
+        </div>
+
         <!-- Altitude -->
         <div class="chart-card">
           <div class="chart-title">Altitude (Baro vs GPS)</div>
@@ -64,7 +70,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, computed, nextTick } from 'vue'
+import { ref, shallowRef, onMounted, computed, nextTick } from 'vue'
 import { db, ref as dbRef, onValue } from './firebase'
 import 'leaflet/dist/leaflet.css'
 import L from 'leaflet'
@@ -80,27 +86,52 @@ let mapInstance = null
 let polyline = null
 let startMarker = null
 let endMarker = null
+let hoverMarker = null
 
-// Data arrays
-const timeHistory = ref([])
-const accelX = ref([]); const accelY = ref([]); const accelZ = ref([])
-const gyroX = ref([]); const gyroY = ref([]); const gyroZ = ref([])
-const baroAlt = ref([]); const gpsAlt = ref([])
-const pdopHistory = ref([]); const satsHistory = ref([])
-const liveLats = ref([]); const liveLons = ref([])
+// Data arrays (Using shallowRef for extreme performance on huge arrays)
+const timeHistory = shallowRef([])
+const accelX = shallowRef([]); const accelY = shallowRef([]); const accelZ = shallowRef([])
+const gyroX = shallowRef([]); const gyroY = shallowRef([]); const gyroZ = shallowRef([])
+const baroAlt = shallowRef([]); const gpsAlt = shallowRef([])
+const speedHistory = shallowRef([])
+const pdopHistory = shallowRef([]); const satsHistory = shallowRef([])
+const liveLats = shallowRef([]); const liveLons = shallowRef([])
 
 // Clear all data
 const clearData = () => {
   timeHistory.value = []
   accelX.value = []; accelY.value = []; accelZ.value = []
   gyroX.value = []; gyroY.value = []; gyroZ.value = []
-  baroAlt.value = []; gpsAlt.value = []
+  baroAlt.value = []; gpsAlt.value = []; speedHistory.value = []
   pdopHistory.value = []; satsHistory.value = []
   liveLats.value = []; liveLons.value = []
   
   if (polyline) polyline.setLatLngs([])
   if (startMarker) mapInstance.removeLayer(startMarker)
   if (endMarker) mapInstance.removeLayer(endMarker)
+  if (hoverMarker) mapInstance.removeLayer(hoverMarker)
+}
+
+// Hover Marker Sync
+const updateHoverMarker = (idx) => {
+  if (idx < 0 || idx >= liveLats.value.length) return
+  const lat = liveLats.value[idx]
+  const lon = liveLons.value[idx]
+  
+  if (!lat || lat === 0 || !lon || lon === 0) {
+    if (hoverMarker) { mapInstance.removeLayer(hoverMarker); hoverMarker = null }
+    return
+  }
+  
+  const latlng = [lat, lon]
+  if (!hoverMarker) {
+    hoverMarker = L.circleMarker(latlng, {
+      color: '#fff', fillColor: '#3B82F6', fillOpacity: 1, radius: 8, weight: 3
+    }).addTo(mapInstance)
+  } else {
+    hoverMarker.setLatLng(latlng)
+    if (!mapInstance.hasLayer(hoverMarker)) hoverMarker.addTo(mapInstance)
+  }
 }
 
 // Format X Axis (Time)
@@ -109,6 +140,18 @@ const formatX = (val) => {
   if (val < 60) return Number(val).toFixed(1) + 's';
   if (val < 3600) return (Number(val) / 60).toFixed(1) + 'm';
   return (Number(val) / 3600).toFixed(2) + 'h';
+}
+
+// Calculate Distance using Haversine formula (returns km)
+const getDistanceFromLatLonInKm = (lat1, lon1, lat2, lon2) => {
+  if (!lat1 || !lon1 || !lat2 || !lon2 || lat1 === 0 || lon1 === 0 || lat2 === 0 || lon2 === 0) return 0;
+  const R = 6371;
+  const dLat = (lat2 - lat1) * (Math.PI/180);
+  const dLon = (lon2 - lon1) * (Math.PI/180);
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+            Math.cos(lat1 * (Math.PI/180)) * Math.cos(lat2 * (Math.PI/180)) * 
+            Math.sin(dLon/2) * Math.sin(dLon/2);
+  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)));
 }
 
 // Chart Options Builder
@@ -123,13 +166,20 @@ const buildOptions = (group, yAxisConfig, colors) => {
   return {
     chart: { 
       id: group + '-chart', group: 'sync-telemetry', type: 'line', 
-      animations: { enabled: !isOfflineMode.value },
+      animations: { enabled: false }, // Completely disable animations to prevent SVG DOM memory spikes
       toolbar: { show: true }, background: 'transparent',
-      foreColor: '#e2e8f0' // Force light text for dark background
+      foreColor: '#e2e8f0', // Force light text for dark background
+      events: {
+        mouseMove: (event, chartContext, config) => {
+          if (config.dataPointIndex !== -1) updateHoverMarker(config.dataPointIndex)
+        },
+        mouseLeave: () => {
+          if (hoverMarker) { mapInstance.removeLayer(hoverMarker); hoverMarker = null }
+        }
+      }
     },
     stroke: { width: 2, curve: 'straight' },
     xaxis: { 
-      categories: timeHistory.value,
       type: 'numeric',
       tickAmount: 10,
       labels: { show: true, formatter: formatX }, 
@@ -146,30 +196,35 @@ const buildOptions = (group, yAxisConfig, colors) => {
   }
 }
 
-const accelOptions = computed(() => buildOptions('accel', { title: { text: 'G' }, tickAmount: 4 }))
+const accelOptions = buildOptions('accel', { title: { text: 'G' }, tickAmount: 4 })
 const accelSeries = computed(() => [
   { name: 'Accel X', data: accelX.value, color: '#EF4444' }, // Vibrant Red
   { name: 'Accel Y', data: accelY.value, color: '#10B981' }, // Vibrant Green
   { name: 'Accel Z', data: accelZ.value, color: '#3B82F6' }  // Vibrant Blue
 ])
 
-const gyroOptions = computed(() => buildOptions('gyro', { title: { text: 'deg/s' }, tickAmount: 4 }))
+const gyroOptions = buildOptions('gyro', { title: { text: 'deg/s' }, tickAmount: 4 })
 const gyroSeries = computed(() => [
   { name: 'Gyro X', data: gyroX.value, color: '#F59E0B' }, // Vibrant Orange
   { name: 'Gyro Y', data: gyroY.value, color: '#8B5CF6' }, // Vibrant Purple
   { name: 'Gyro Z', data: gyroZ.value, color: '#06B6D4' }  // Vibrant Cyan
 ])
 
-const altOptions = computed(() => buildOptions('alt', { title: { text: 'Meters' }, tickAmount: 4 }))
+const altOptions = buildOptions('alt', { title: { text: 'Meters' }, tickAmount: 4 })
 const altSeries = computed(() => [
   { name: 'Baro Altitude', data: baroAlt.value, color: '#FCD34D' }, // Yellow
   { name: 'GPS Altitude', data: gpsAlt.value, color: '#2DD4BF' }    // Teal
 ])
 
-const gpsOptions = computed(() => buildOptions('gps', [
+const speedOptions = buildOptions('speed', { title: { text: 'km/h' }, tickAmount: 4, min: 0 })
+const speedSeries = computed(() => [
+  { name: 'Speed', data: speedHistory.value, color: '#F43F5E' } // Rose red
+])
+
+const gpsOptions = buildOptions('gps', [
   { seriesName: 'Satellites', title: { text: 'Satellites' }, min: 0, tickAmount: 4 },
   { opposite: true, seriesName: 'PDOP', title: { text: 'PDOP' }, min: 0, tickAmount: 4 }
-]))
+])
 const gpsSeries = computed(() => [
   { name: 'Satellites', data: satsHistory.value, color: '#F472B6' }, // Pink
   { name: 'PDOP', data: pdopHistory.value, color: '#E2E8F0' }        // White-ish
@@ -216,7 +271,9 @@ const handleFileUpload = async (event) => {
 
   // Temporary arrays for bulk push
   const tempTime = [], tempAx = [], tempAy = [], tempAz = [], tempGx = [], tempGy = [], tempGz = []
-  const tempBAlt = [], tempGAlt = [], tempPdop = [], tempSats = [], tempLat = [], tempLon = []
+  const tempBAlt = [], tempGAlt = [], tempSpeed = [], tempPdop = [], tempSats = [], tempLat = [], tempLon = []
+  
+  let prevT = null; let prevLat = null; let prevLon = null;
 
   if (file.name.endsWith('.bin')) {
     const buffer = await file.arrayBuffer()
@@ -224,25 +281,38 @@ const handleFileUpload = async (event) => {
     let offset = 0
     const structLen = 58
     
+    // Downsample large files to prevent browser crashes (max ~400 points)
+    const totalStructs = Math.floor(buffer.byteLength / structLen)
+    const step = Math.max(1, Math.floor(totalStructs / 400))
+    
     while (offset + structLen <= buffer.byteLength) {
-      tempTime.push(parseFloat((view.getUint32(offset, true) / 1000).toFixed(1)))
-      tempAx.push(view.getFloat32(offset + 8, true))
-      tempAy.push(view.getFloat32(offset + 12, true))
-      tempAz.push(view.getFloat32(offset + 16, true))
-      tempGx.push(view.getFloat32(offset + 20, true))
-      tempGy.push(view.getFloat32(offset + 24, true))
-      tempGz.push(view.getFloat32(offset + 28, true))
-      tempBAlt.push(view.getFloat32(offset + 32, true))
+      const t = parseFloat((view.getUint32(offset, true) / 1000).toFixed(1))
+      tempTime.push(t)
+      tempAx.push([t, view.getFloat32(offset + 8, true)])
+      tempAy.push([t, view.getFloat32(offset + 12, true)])
+      tempAz.push([t, view.getFloat32(offset + 16, true)])
+      tempGx.push([t, view.getFloat32(offset + 20, true)])
+      tempGy.push([t, view.getFloat32(offset + 24, true)])
+      tempGz.push([t, view.getFloat32(offset + 28, true)])
+      tempBAlt.push([t, view.getFloat32(offset + 32, true)])
       
       const lat = view.getFloat32(offset + 36, true)
       const lon = view.getFloat32(offset + 40, true)
-      if (lat !== 0 && lon !== 0) { tempLat.push(lat); tempLon.push(lon) }
+      tempLat.push(lat); tempLon.push(lon) // Push all points to maintain 1:1 index mapping
       
-      tempGAlt.push(view.getFloat32(offset + 44, true))
-      tempPdop.push(view.getFloat32(offset + 48, true))
-      tempSats.push(view.getUint8(offset + 53))
+      let speed = 0;
+      if (prevLat && prevLon && prevT && lat !== 0 && lon !== 0) {
+        const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, lat, lon);
+        if (t - prevT > 0) speed = (distKm / (t - prevT)) * 3600;
+      }
+      if (lat !== 0 && lon !== 0) { prevLat = lat; prevLon = lon; prevT = t; }
+      tempSpeed.push([t, speed])
       
-      offset += structLen
+      tempGAlt.push([t, view.getFloat32(offset + 44, true)])
+      tempPdop.push([t, view.getFloat32(offset + 48, true)])
+      tempSats.push([t, view.getUint8(offset + 53)])
+      
+      offset += structLen * step
     }
   } else if (file.name.endsWith('.csv')) {
     const text = await file.text()
@@ -253,7 +323,10 @@ const handleFileUpload = async (event) => {
     const header = lines[0].trim()
     const isNewFormat = header.startsWith("Time,Ax")
     
-    for (let i = 1; i < lines.length; i++) {
+    // Downsample large files to prevent browser crashes (max ~400 points)
+    const step = Math.max(1, Math.floor(lines.length / 400))
+    
+    for (let i = 1; i < lines.length; i += step) {
       if (!lines[i].trim()) continue
       const cols = lines[i].split(',')
       
@@ -261,27 +334,45 @@ const handleFileUpload = async (event) => {
         if (cols.length < 13) continue
         
         // Time is already in ms (Date.now()) or timestamp
-        tempTime.push(parseFloat((parseFloat(cols[0]) / 1000).toFixed(1)))
-        tempAx.push(parseFloat(cols[1])); tempAy.push(parseFloat(cols[2])); tempAz.push(parseFloat(cols[3]))
-        tempGx.push(parseFloat(cols[4])); tempGy.push(parseFloat(cols[5])); tempGz.push(parseFloat(cols[6]))
-        tempBAlt.push(parseFloat(cols[7]))
+        const t = parseFloat((parseFloat(cols[0]) / 1000).toFixed(1))
+        tempTime.push(t)
+        tempAx.push([t, parseFloat(cols[1])]); tempAy.push([t, parseFloat(cols[2])]); tempAz.push([t, parseFloat(cols[3])])
+        tempGx.push([t, parseFloat(cols[4])]); tempGy.push([t, parseFloat(cols[5])]); tempGz.push([t, parseFloat(cols[6])])
+        tempBAlt.push([t, parseFloat(cols[7])])
         
         const lat = parseFloat(cols[8]); const lon = parseFloat(cols[9])
-        if (lat !== 0 && lon !== 0) { tempLat.push(lat); tempLon.push(lon) }
+        tempLat.push(lat); tempLon.push(lon) // Push all points to maintain 1:1 index mapping
         
-        tempGAlt.push(parseFloat(cols[10])); tempPdop.push(parseFloat(cols[11])); tempSats.push(parseFloat(cols[12]))
+        let speed = 0;
+        if (prevLat && prevLon && prevT && lat !== 0 && lon !== 0) {
+          const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, lat, lon);
+          if (t - prevT > 0) speed = (distKm / (t - prevT)) * 3600;
+        }
+        if (lat !== 0 && lon !== 0) { prevLat = lat; prevLon = lon; prevT = t; }
+        tempSpeed.push([t, speed])
+        
+        tempGAlt.push([t, parseFloat(cols[10])]); tempPdop.push([t, parseFloat(cols[11])]); tempSats.push([t, parseFloat(cols[12])])
       } else {
         if (cols.length < 21) continue
         
-        tempTime.push(parseFloat((parseFloat(cols[0]) / 1000).toFixed(1)))
-        tempAx.push(parseFloat(cols[8])); tempAy.push(parseFloat(cols[9])); tempAz.push(parseFloat(cols[10]))
-        tempGx.push(parseFloat(cols[11])); tempGy.push(parseFloat(cols[12])); tempGz.push(parseFloat(cols[13]))
-        tempBAlt.push(parseFloat(cols[14]))
+        const t = parseFloat((parseFloat(cols[0]) / 1000).toFixed(1))
+        tempTime.push(t)
+        tempAx.push([t, parseFloat(cols[8])]); tempAy.push([t, parseFloat(cols[9])]); tempAz.push([t, parseFloat(cols[10])])
+        tempGx.push([t, parseFloat(cols[11])]); tempGy.push([t, parseFloat(cols[12])]); tempGz.push([t, parseFloat(cols[13])])
+        tempBAlt.push([t, parseFloat(cols[14])])
         
         const lat = parseFloat(cols[15]); const lon = parseFloat(cols[16])
-        if (lat !== 0 && lon !== 0) { tempLat.push(lat); tempLon.push(lon) }
+        tempLat.push(lat); tempLon.push(lon) // Push all points to maintain 1:1 index mapping
         
-        tempGAlt.push(parseFloat(cols[17])); tempPdop.push(parseFloat(cols[18])); tempSats.push(parseFloat(cols[20]))
+        let speed = 0;
+        if (prevLat && prevLon && prevT && lat !== 0 && lon !== 0) {
+          const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, lat, lon);
+          if (t - prevT > 0) speed = (distKm / (t - prevT)) * 3600;
+        }
+        if (lat !== 0 && lon !== 0) { prevLat = lat; prevLon = lon; prevT = t; }
+        tempSpeed.push([t, speed])
+        
+        tempGAlt.push([t, parseFloat(cols[17])]); tempPdop.push([t, parseFloat(cols[18])]); tempSats.push([t, parseFloat(cols[20])])
       }
     }
   }
@@ -290,16 +381,21 @@ const handleFileUpload = async (event) => {
   timeHistory.value = tempTime
   accelX.value = tempAx; accelY.value = tempAy; accelZ.value = tempAz
   gyroX.value = tempGx; gyroY.value = tempGy; gyroZ.value = tempGz
-  baroAlt.value = tempBAlt; gpsAlt.value = tempGAlt
+  baroAlt.value = tempBAlt; gpsAlt.value = tempGAlt; speedHistory.value = tempSpeed
   pdopHistory.value = tempPdop; satsHistory.value = tempSats
+  liveLats.value = tempLat; liveLons.value = tempLon
   
   updateMapPath(tempLat, tempLon)
 }
 
 const updateMapPath = (lats, lons) => {
-  if (lats.length === 0) return
-  const latlngs = lats.map((lat, i) => [lat, lons[i]])
-  polyline.setLatLngs(latlngs)
+  const validLatLngs = []
+  for (let i = 0; i < lats.length; i++) {
+    if (lats[i] !== 0 && lons[i] !== 0) validLatLngs.push([lats[i], lons[i]])
+  }
+  if (validLatLngs.length === 0) return
+  
+  polyline.setLatLngs(validLatLngs)
   
   const greenIcon = new L.Icon({
     iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png',
@@ -314,8 +410,8 @@ const updateMapPath = (lats, lons) => {
   
   if (startMarker) mapInstance.removeLayer(startMarker)
   if (endMarker) mapInstance.removeLayer(endMarker)
-  startMarker = L.marker(latlngs[0], {icon: greenIcon}).bindPopup("Start").addTo(mapInstance)
-  endMarker = L.marker(latlngs[latlngs.length - 1], {icon: redIcon}).bindPopup("End").addTo(mapInstance)
+  startMarker = L.marker(validLatLngs[0], {icon: greenIcon}).bindPopup("Start").addTo(mapInstance)
+  endMarker = L.marker(validLatLngs[validLatLngs.length - 1], {icon: redIcon}).bindPopup("End").addTo(mapInstance)
   mapInstance.fitBounds(polyline.getBounds(), { padding: [20, 20] })
 }
 
@@ -358,29 +454,48 @@ onMounted(() => {
       const MAX_PTS = 120 // ~1 minute at 2Hz
       
       // Gunakan timestamp dari mikrokontroler (dalam detik) agar grafik numeric x-axis berfungsi
-      const timeLabel = data.ts ? (data.ts / 1000) : (Date.now() / 1000)
-      timeHistory.value = [...timeHistory.value, timeLabel].slice(-MAX_PTS)
+      const t = data.ts ? (data.ts / 1000) : (Date.now() / 1000)
       
-      // Menggunakan reassignment agar Vue Reactivity memicu render ulang pada ApexCharts
-      accelX.value = [...accelX.value, data.ax || 0].slice(-MAX_PTS)
-      accelY.value = [...accelY.value, data.ay || 0].slice(-MAX_PTS)
-      accelZ.value = [...accelZ.value, data.az || 0].slice(-MAX_PTS)
-      
-      gyroX.value = [...gyroX.value, data.gx || 0].slice(-MAX_PTS)
-      gyroY.value = [...gyroY.value, data.gy || 0].slice(-MAX_PTS)
-      gyroZ.value = [...gyroZ.value, data.gz || 0].slice(-MAX_PTS)
-      
-      baroAlt.value = [...baroAlt.value, data.alt || 0].slice(-MAX_PTS)
-      gpsAlt.value = [...gpsAlt.value, data.galt || 0].slice(-MAX_PTS)
-      pdopHistory.value = [...pdopHistory.value, data.pd || 0].slice(-MAX_PTS)
-      satsHistory.value = [...satsHistory.value, data.ns || 0].slice(-MAX_PTS)
-      
-      // Simpan history GPS untuk menggambar garis lintasan
-      if (data.lat && data.lon && data.lat !== 0 && data.lon !== 0) {
-        liveLats.value.push(data.lat)
-        liveLons.value.push(data.lon)
-        updateMapPath(liveLats.value, liveLons.value)
+      // Calculate speed
+      let speed = 0
+      if (liveLats.value.length > 0 && liveLons.value.length > 0 && timeHistory.value.length > 0) {
+         // Find the last valid GPS point to compute delta distance
+         let lastValidIdx = liveLats.value.length - 1
+         while (lastValidIdx >= 0 && (liveLats.value[lastValidIdx] === 0 || !liveLats.value[lastValidIdx])) {
+           lastValidIdx--
+         }
+         
+         if (lastValidIdx >= 0 && data.lat && data.lon && data.lat !== 0 && data.lon !== 0) {
+           const prevLat = liveLats.value[lastValidIdx]
+           const prevLon = liveLons.value[lastValidIdx]
+           const prevT = timeHistory.value[lastValidIdx]
+           
+           const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, data.lat, data.lon)
+           const dtSec = t - prevT
+           if (dtSec > 0) speed = (distKm / dtSec) * 3600
+         }
       }
+      speedHistory.value = [...speedHistory.value, [t, speed]].slice(-MAX_PTS)
+      
+      timeHistory.value = [...timeHistory.value, t].slice(-MAX_PTS)
+      
+      accelX.value = [...accelX.value, [t, data.ax || 0]].slice(-MAX_PTS)
+      accelY.value = [...accelY.value, [t, data.ay || 0]].slice(-MAX_PTS)
+      accelZ.value = [...accelZ.value, [t, data.az || 0]].slice(-MAX_PTS)
+      
+      gyroX.value = [...gyroX.value, [t, data.gx || 0]].slice(-MAX_PTS)
+      gyroY.value = [...gyroY.value, [t, data.gy || 0]].slice(-MAX_PTS)
+      gyroZ.value = [...gyroZ.value, [t, data.gz || 0]].slice(-MAX_PTS)
+      
+      baroAlt.value = [...baroAlt.value, [t, data.alt || 0]].slice(-MAX_PTS)
+      gpsAlt.value = [...gpsAlt.value, [t, data.galt || 0]].slice(-MAX_PTS)
+      pdopHistory.value = [...pdopHistory.value, [t, data.pd || 0]].slice(-MAX_PTS)
+      satsHistory.value = [...satsHistory.value, [t, data.ns || 0]].slice(-MAX_PTS)
+      
+      // Simpan history GPS untuk menggambar garis lintasan dan melacak titik hover
+      liveLats.value = [...liveLats.value, data.lat || 0].slice(-MAX_PTS)
+      liveLons.value = [...liveLons.value, data.lon || 0].slice(-MAX_PTS)
+      updateMapPath(liveLats.value, liveLons.value)
       
       // Rekam data ke CSV jika mode record aktif
       if (isRecording.value) {

@@ -18,6 +18,10 @@
           Upload Log (.bin / .csv)
           <input type="file" accept=".bin,.csv" @change="handleFileUpload" hidden />
         </label>
+        <label class="file-upload-btn" style="background-color: var(--secondary); color: #fff;">
+          Convert .bin to .csv
+          <input type="file" accept=".bin" @change="convertBinToCsv" hidden />
+        </label>
         <div class="status" :class="isConnected ? 'status-connected' : 'status-disconnected'">
           {{ isConnected ? 'Live Connection' : (isOfflineMode ? 'Offline Log Mode' : 'Connecting...') }}
         </div>
@@ -261,6 +265,57 @@ const toggleRecording = () => {
 }
 
 // File Upload Handler (Offline Data)
+const convertBinToCsv = async (event) => {
+  const file = event.target.files[0]
+  if (!file) return
+  
+  const buffer = await file.arrayBuffer()
+  const view = new DataView(buffer)
+  let offset = 0
+  const structLen = 58
+  
+  let csv = "Timestamp_ms,GPS_Year,GPS_Month,GPS_Day,GPS_Hour,GPS_Min,GPS_Sec,Time_Valid,Accel_X(G),Accel_Y(G),Accel_Z(G),Gyro_X(deg/s),Gyro_Y(deg/s),Gyro_Z(deg/s),Baro_Altitude(m),Latitude,Longitude,GPS_Altitude(m),PDOP,Fix_Type,Satellites\n"
+  
+  while (offset + structLen <= buffer.byteLength) {
+    const ts = view.getUint32(offset, true)
+    const yr = view.getUint16(offset + 4, true)
+    const mo = view.getUint8(offset + 6)
+    const day = view.getUint8(offset + 7)
+    const hr = view.getUint8(offset + 8)
+    const mi = view.getUint8(offset + 9)
+    const se = view.getUint8(offset + 10)
+    const tv = view.getUint8(offset + 11)
+    
+    const ax = view.getFloat32(offset + 12, true).toFixed(6)
+    const ay = view.getFloat32(offset + 16, true).toFixed(6)
+    const az = view.getFloat32(offset + 20, true).toFixed(6)
+    const gx = view.getFloat32(offset + 24, true).toFixed(6)
+    const gy = view.getFloat32(offset + 28, true).toFixed(6)
+    const gz = view.getFloat32(offset + 32, true).toFixed(6)
+    const alt = view.getFloat32(offset + 36, true).toFixed(2)
+    
+    const lat = view.getFloat32(offset + 40, true).toFixed(7)
+    const lon = view.getFloat32(offset + 44, true).toFixed(7)
+    const galt = view.getFloat32(offset + 48, true).toFixed(2)
+    const pdop = view.getFloat32(offset + 52, true).toFixed(2)
+    
+    const fix = view.getUint8(offset + 56)
+    const sats = view.getUint8(offset + 57)
+    
+    csv += `${ts},${yr},${mo},${day},${hr},${mi},${se},${tv},${ax},${ay},${az},${gx},${gy},${gz},${alt},${lat},${lon},${galt},${pdop},${fix},${sats}\n`
+    offset += structLen
+  }
+  
+  const blob = new Blob([csv], { type: 'text/csv' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = file.name.replace('.bin', '.csv')
+  a.click()
+  URL.revokeObjectURL(url)
+  event.target.value = ''
+}
+
 const handleFileUpload = async (event) => {
   const file = event.target.files[0]
   if (!file) return
@@ -288,16 +343,16 @@ const handleFileUpload = async (event) => {
     while (offset + structLen <= buffer.byteLength) {
       const t = parseFloat((view.getUint32(offset, true) / 1000).toFixed(1))
       tempTime.push(t)
-      tempAx.push([t, view.getFloat32(offset + 8, true)])
-      tempAy.push([t, view.getFloat32(offset + 12, true)])
-      tempAz.push([t, view.getFloat32(offset + 16, true)])
-      tempGx.push([t, view.getFloat32(offset + 20, true)])
-      tempGy.push([t, view.getFloat32(offset + 24, true)])
-      tempGz.push([t, view.getFloat32(offset + 28, true)])
-      tempBAlt.push([t, view.getFloat32(offset + 32, true)])
+      tempAx.push([t, view.getFloat32(offset + 12, true)])
+      tempAy.push([t, view.getFloat32(offset + 16, true)])
+      tempAz.push([t, view.getFloat32(offset + 20, true)])
+      tempGx.push([t, view.getFloat32(offset + 24, true)])
+      tempGy.push([t, view.getFloat32(offset + 28, true)])
+      tempGz.push([t, view.getFloat32(offset + 32, true)])
+      tempBAlt.push([t, view.getFloat32(offset + 36, true)])
       
-      const lat = view.getFloat32(offset + 36, true)
-      const lon = view.getFloat32(offset + 40, true)
+      const lat = view.getFloat32(offset + 40, true)
+      const lon = view.getFloat32(offset + 44, true)
       tempLat.push(lat); tempLon.push(lon) // Push all points to maintain 1:1 index mapping
       
       let speed = 0;
@@ -308,9 +363,9 @@ const handleFileUpload = async (event) => {
       if (lat !== 0 && lon !== 0) { prevLat = lat; prevLon = lon; prevT = t; }
       tempSpeed.push([t, speed])
       
-      tempGAlt.push([t, view.getFloat32(offset + 44, true)])
-      tempPdop.push([t, view.getFloat32(offset + 48, true)])
-      tempSats.push([t, view.getUint8(offset + 53)])
+      tempGAlt.push([t, view.getFloat32(offset + 48, true)])
+      tempPdop.push([t, view.getFloat32(offset + 52, true)])
+      tempSats.push([t, view.getUint8(offset + 57)])
       
       offset += structLen * step
     }

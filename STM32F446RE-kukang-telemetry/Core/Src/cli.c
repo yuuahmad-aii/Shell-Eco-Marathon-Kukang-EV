@@ -8,6 +8,7 @@
 #include "mpu9250.h"
 #include "gps_neo6m.h"
 #include "speed.h"
+#include "fatfs.h"
 
 extern SPI_HandleTypeDef hspi1;
 
@@ -58,6 +59,10 @@ static void CLI_ParseCommand(void) {
         v_i = (int)current_config.burn_speed_max;
         v_f = (int)(current_config.burn_speed_max * 100) % 100; if(v_f < 0) v_f = -v_f;
         CLI_Print("$21=%d.%02d (Burn Speed Max km/h)\r\n", v_i, v_f);
+        
+        v_i = (int)current_config.log_interval_ms;
+        v_f = (int)(current_config.log_interval_ms * 100) % 100; if(v_f < 0) v_f = -v_f;
+        CLI_Print("$30=%d.%02d (Log Interval ms)\r\n", v_i, v_f);
         
         CLI_Print("ok\r\n");
     }
@@ -142,11 +147,45 @@ static void CLI_ParseCommand(void) {
         
         CLI_Print("ok\r\n");
     }
+    else if (strcmp(cli_buffer, "$sd") == 0) {
+        DIR dir;
+        FILINFO fno;
+        FRESULT res;
+        
+        CLI_Print("--- SD Card Files ---\r\n");
+        
+        res = f_mount(&SDFatFS, SDPath, 1);
+        if (res == FR_OK) {
+            res = f_opendir(&dir, "/");
+            if (res == FR_OK) {
+                for (;;) {
+                    res = f_readdir(&dir, &fno);
+                    if (res != FR_OK || fno.fname[0] == 0) break;
+                    
+                    if (fno.fattrib & AM_DIR) {
+                        CLI_Print("DIR  %s\r\n", fno.fname);
+                    } else {
+                        uint32_t size_kb = (fno.fsize + 1023) / 1024;
+                        CLI_Print("FILE %s (%lu KB)\r\n", fno.fname, size_kb);
+                    }
+                }
+                f_closedir(&dir);
+                CLI_Print("Done.\r\n");
+            } else {
+                CLI_Print("error: failed to open root dir (%d)\r\n", res);
+            }
+        } else {
+            CLI_Print("error: failed to mount SD card (%d)\r\n", res);
+        }
+        
+        CLI_Print("ok\r\n");
+    }
     else if (strcmp(cli_buffer, "$help") == 0) {
         CLI_Print("Available commands:\r\n");
         CLI_Print("$$    - View all parameters\r\n");
         CLI_Print("$?    - View all sensors\r\n");
         CLI_Print("$i    - View firmware info\r\n");
+        CLI_Print("$sd   - List SD card files\r\n");
         CLI_Print("$x=y  - Set parameter x to value y\r\n");
         CLI_Print("$save - Save config to Flash\r\n");
         CLI_Print("ok\r\n");
@@ -171,6 +210,7 @@ static void CLI_ParseCommand(void) {
                 case 11: current_config.pulses_per_rev = value; CLI_Print("ok\r\n"); break;
                 case 20: current_config.coast_speed_min = value; CLI_Print("ok\r\n"); break;
                 case 21: current_config.burn_speed_max = value; CLI_Print("ok\r\n"); break;
+                case 30: current_config.log_interval_ms = value; CLI_Print("ok\r\n"); break;
                 default: CLI_Print("error: unknown parameter\r\n"); break;
             }
         } else {

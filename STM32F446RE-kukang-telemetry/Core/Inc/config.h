@@ -4,7 +4,7 @@
 #include "main.h"
 
 // Magic word to check if flash has valid config
-#define CONFIG_MAGIC 0x12345678
+#define CONFIG_MAGIC 0x12345679
 
 // Storage structure for GRBL parameters
 typedef struct {
@@ -15,6 +15,7 @@ typedef struct {
     float pulses_per_rev;     // $11
     float coast_speed_min;    // $20
     float burn_speed_max;     // $21
+    float log_interval_ms;    // $30
 } ConfigData;
 
 extern ConfigData current_config;

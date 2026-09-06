@@ -14,6 +14,7 @@ static void Config_SetDefaults(void) {
     current_config.pulses_per_rev = 1.0f;      // Default 1 pulse per rev
     current_config.coast_speed_min = 15.0f;    // 15 km/h
     current_config.burn_speed_max = 35.0f;     // 35 km/h
+    current_config.log_interval_ms = 50.0f;    // 50 ms default
 }
 
 void Config_Init(void) {

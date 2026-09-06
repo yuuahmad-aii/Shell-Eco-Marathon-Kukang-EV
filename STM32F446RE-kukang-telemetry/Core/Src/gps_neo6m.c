@@ -53,8 +53,6 @@ static void UBX_ProcessPayload() {
       current_gps_data.pdop = pdop_raw / 100.0f;
       new_data_available = 1;
     } else if (ubx_id == 0x21 && ubx_len >= 20) { // NAV-TIMEUTC (For NEO-6M)
-      uint8_t valid = ubx_payload[19];
-
       current_gps_data.year = (ubx_payload[13] << 8) | ubx_payload[12];
       current_gps_data.month = ubx_payload[14];
       current_gps_data.day = ubx_payload[15];
@@ -62,8 +60,9 @@ static void UBX_ProcessPayload() {
       current_gps_data.min = ubx_payload[17];
       current_gps_data.sec = ubx_payload[18];
 
-      // validUTC is bit 2 (0x04)
-      current_gps_data.is_time_valid = (valid & 0x04) ? 1 : 0;
+      // ValidUTC (bit 2) takes up to 12.5 minutes to download leap seconds.
+      // We can consider the time valid enough for logging as soon as the year is reasonable.
+      current_gps_data.is_time_valid = (current_gps_data.year >= 2020) ? 1 : 0;
       new_data_available = 1;
     } else if (ubx_id == 0x07 && ubx_len >= 92) { // NAV-PVT
       // mulai diperkenalkan pada u-blox generasi 7 (seperti NEO-7M) dan
@@ -127,10 +126,14 @@ static void GPS_Enable_Message(uint8_t class_id, uint8_t msg_id, uint8_t rate) {
   cfg_msg[14] = ck_a;
   cfg_msg[15] = ck_b;
   HAL_UART_Transmit(gps_huart, cfg_msg, sizeof(cfg_msg), 100);
+  HAL_Delay(10); // Give GPS time to process
 }
 
 void GPS_Init(UART_HandleTypeDef *huart) {
   gps_huart = huart;
+
+  // Give GPS module time to boot up before blasting config commands
+  HAL_Delay(500);
 
   // 1. Explicitly enable required UBX messages (Rate = 1 per epoch)
   GPS_Enable_Message(0x01, 0x21, 1); // NAV-TIMEUTC (Time & Date)
@@ -142,6 +145,7 @@ void GPS_Init(UART_HandleTypeDef *huart) {
   uint8_t cfg_rxm[] = {0xB5, 0x62, 0x06, 0x11, 0x02,
                        0x00, 0x08, 0x00, 0x21, 0x91};
   HAL_UART_Transmit(gps_huart, cfg_rxm, sizeof(cfg_rxm), 100);
+  HAL_Delay(10);
 
   // 3. Set Dynamic Platform Model to Automotive (UBX-CFG-NAV5)
   // This improves tracking reliability at higher speeds and accelerations
@@ -159,10 +163,12 @@ void GPS_Init(UART_HandleTypeDef *huart) {
   cfg_nav5[42] = nav5_ck_a;
   cfg_nav5[43] = nav5_ck_b;
   HAL_UART_Transmit(gps_huart, cfg_nav5, sizeof(cfg_nav5), 100);
+  HAL_Delay(10);
 
   // 4. Poll MON-VER for firmware version
   uint8_t mon_ver_poll[] = {0xB5, 0x62, 0x0A, 0x04, 0x00, 0x00, 0x0E, 0x34};
   HAL_UART_Transmit(gps_huart, mon_ver_poll, sizeof(mon_ver_poll), 100);
+  HAL_Delay(10);
 
   HAL_UART_Receive_IT(gps_huart, &rx_data, 1);
 }

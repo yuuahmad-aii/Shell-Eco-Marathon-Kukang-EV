@@ -246,10 +246,97 @@ int main(void)
   uint8_t is_logging = 0;
   uint32_t log_start_time = 0;
 
+  uint32_t last_ui_tick = 0;
+  uint32_t last_log_tick = 0;
+  
+  char current_filename[16] = {0};
+
   while (1) {
     CLI_Task();
     
-    uint8_t buttons = TM1638_ReadButtons();
+    uint32_t current_tick = HAL_GetTick();
+    
+    // --- Logging Task (Configurable Interval) ---
+    // Must run BEFORE UI Task to prevent SDIO FIFO polling from colliding with SPI2 DMA!
+    if (is_logging) {
+      if (current_tick - last_log_tick >= (uint32_t)current_config.log_interval_ms) {
+        last_log_tick = current_tick;
+        
+        LogData log_entry;
+        log_entry.timestamp_ms = current_tick - log_start_time;
+        log_entry.year = gps_data.year;
+        log_entry.month = gps_data.month;
+        log_entry.day = gps_data.day;
+        log_entry.hour = gps_data.hour;
+        log_entry.min = gps_data.min;
+        log_entry.sec = gps_data.sec;
+        log_entry.gps_time_valid = gps_data.is_time_valid;
+        
+        log_entry.accel_x = imu_data.accel_x;
+        log_entry.accel_y = imu_data.accel_y;
+        log_entry.accel_z = imu_data.accel_z;
+        log_entry.gyro_x = imu_data.gyro_x;
+        log_entry.gyro_y = imu_data.gyro_y;
+        log_entry.gyro_z = imu_data.gyro_z;
+        log_entry.altitude = bmp_data.altitude;
+        log_entry.latitude = gps_data.latitude;
+        log_entry.longitude = gps_data.longitude;
+        log_entry.gps_altitude = gps_data.gps_altitude;
+        log_entry.pdop = gps_data.pdop;
+        log_entry.fix_type = gps_data.fix_type;
+        log_entry.num_satellites = gps_data.num_satellites;
+        
+        UINT bytes_written = 0;
+        FRESULT w_res = f_write(&SDFile, &log_entry, sizeof(LogData), &bytes_written);
+        if (w_res != FR_OK || bytes_written == 0) {
+            CLI_Print("Log err: write %d. Recovering SD...\r\n", w_res);
+            
+            // Auto Recovery Mechanism
+            f_close(&SDFile);
+            f_mount(NULL, SDPath, 1); // Force unmount
+            
+            if (f_mount(&SDFatFS, SDPath, 1) == FR_OK) {
+                if (f_open(&SDFile, current_filename, FA_OPEN_APPEND | FA_WRITE) == FR_OK) {
+                    CLI_Print("SD Recovered!\r\n");
+                } else {
+                    is_logging = 0; // Fatal error, stop logging
+                    CLI_Print("SD Recovery failed\r\n");
+                }
+            } else {
+                is_logging = 0;
+                CLI_Print("SD Mount failed\r\n");
+            }
+        }
+        
+        // We only sync once per second to ensure data is saved without stalling.
+        static uint32_t last_sync_tick = 0;
+        if (is_logging && (current_tick - last_sync_tick >= 1000)) {
+          FRESULT s_res = f_sync(&SDFile);
+          if (s_res != FR_OK) {
+              CLI_Print("Log err: sync %d. Recovering SD...\r\n", s_res);
+              // Same recovery logic for sync
+              f_close(&SDFile);
+              f_mount(NULL, SDPath, 1);
+              if (f_mount(&SDFatFS, SDPath, 1) == FR_OK) {
+                  if (f_open(&SDFile, current_filename, FA_OPEN_APPEND | FA_WRITE) == FR_OK) {
+                      CLI_Print("SD Recovered!\r\n");
+                  } else {
+                      is_logging = 0;
+                  }
+              } else {
+                  is_logging = 0;
+              }
+          }
+          last_sync_tick = current_tick;
+        }
+      } // End if (interval)
+    } // End if (is_logging)
+    
+    // --- UI and Sensor Task (20 Hz / 50ms) ---
+    if (current_tick - last_ui_tick >= 50) {
+      last_ui_tick = current_tick;
+      
+      uint8_t buttons = TM1638_ReadButtons();
 
     // Check buttons (S8 = 0x80, S7 = 0x40, S6 = 0x20, S5 = 0x10)
     if (buttons != prev_buttons) {
@@ -285,19 +372,26 @@ int main(void)
         if (is_logging) {
           f_close(&SDFile);
           is_logging = 0;
+          CLI_Print("Log stopped\r\n");
         } else {
-          if (f_mount(&SDFatFS, SDPath, 1) == FR_OK) {
-            char filename[16];
+          FRESULT mount_res = f_mount(&SDFatFS, SDPath, 1);
+          if (mount_res == FR_OK) {
             uint16_t file_index = 1;
             while (file_index < 1000) {
-              sprintf(filename, "log%u.bin", file_index);
-              if (f_open(&SDFile, filename, FA_CREATE_NEW | FA_WRITE) == FR_OK) {
+              sprintf(current_filename, "log%u.bin", file_index);
+              FRESULT open_res = f_open(&SDFile, current_filename, FA_CREATE_NEW | FA_WRITE);
+              if (open_res == FR_OK) {
                 is_logging = 1;
                 log_start_time = HAL_GetTick();
+                last_log_tick = log_start_time; // Reset log tick
+                CLI_Print("Log started: %s\r\n", current_filename);
                 break;
               }
               file_index++;
             }
+            if (file_index >= 1000) CLI_Print("Log err: index full\r\n");
+          } else {
+            CLI_Print("Log err: mount %d\r\n", mount_res);
           }
         }
       }
@@ -365,43 +459,44 @@ int main(void)
       break;
     }
 
-    if (is_logging) {
-      if ((HAL_GetTick() / 500) % 2) {
-        led_mask |= 0x80; // Blink LED 8
+      if (is_logging) {
+        if ((current_tick / 500) % 2) {
+          led_mask |= 0x80; // Blink LED 8
+        }
       }
+
+      TM1638_SendDMA(display_str, led_mask);
+    } // End UI Task
+    
+    // --- Coprocessor Telemetry Task (2 Hz / 500ms) ---
+    static uint32_t last_telemetry_tick = 0;
+    if (current_tick - last_telemetry_tick >= 500) {
+      last_telemetry_tick = current_tick;
       
-      LogData log_entry;
-      log_entry.timestamp_ms = HAL_GetTick() - log_start_time;
-      log_entry.year = gps_data.year;
-      log_entry.month = gps_data.month;
-      log_entry.day = gps_data.day;
-      log_entry.hour = gps_data.hour;
-      log_entry.min = gps_data.min;
-      log_entry.sec = gps_data.sec;
-      log_entry.gps_time_valid = gps_data.is_time_valid;
-      
-      log_entry.accel_x = imu_data.accel_x;
-      log_entry.accel_y = imu_data.accel_y;
-      log_entry.accel_z = imu_data.accel_z;
-      log_entry.gyro_x = imu_data.gyro_x;
-      log_entry.gyro_y = imu_data.gyro_y;
-      log_entry.gyro_z = imu_data.gyro_z;
-      log_entry.altitude = bmp_data.altitude;
-      log_entry.latitude = gps_data.latitude;
-      log_entry.longitude = gps_data.longitude;
-      log_entry.gps_altitude = gps_data.gps_altitude;
-      log_entry.pdop = gps_data.pdop;
-      log_entry.fix_type = gps_data.fix_type;
-      log_entry.num_satellites = gps_data.num_satellites;
-      
-      UINT bytes_written = 0;
-      f_write(&SDFile, &log_entry, sizeof(LogData), &bytes_written);
-      f_sync(&SDFile);
+      static char tele_buf[256];
+      int len = snprintf(tele_buf, sizeof(tele_buf),
+          "{\"ts\":%lu,\"y\":%u,\"m\":%u,\"d\":%u,\"h\":%u,\"min\":%u,\"s\":%u,\"v\":%u,"
+          "\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,"
+          "\"gx\":%.1f,\"gy\":%.1f,\"gz\":%.1f,"
+          "\"alt\":%.1f,"
+          "\"lat\":%.6f,\"lon\":%.6f,\"galt\":%.1f,"
+          "\"pd\":%.1f,\"fix\":%u,\"ns\":%u,"
+          "\"sl\":%.1f,\"sr\":%.1f}\n",
+          current_tick, gps_data.year, gps_data.month, gps_data.day, gps_data.hour, gps_data.min, gps_data.sec, gps_data.is_time_valid,
+          imu_data.accel_x, imu_data.accel_y, imu_data.accel_z,
+          imu_data.gyro_x, imu_data.gyro_y, imu_data.gyro_z,
+          bmp_data.altitude,
+          gps_data.latitude, gps_data.longitude, gps_data.gps_altitude,
+          gps_data.pdop, gps_data.fix_type, gps_data.num_satellites,
+          speed_left_kmh, speed_right_kmh);
+          
+      if (len > 0 && len < sizeof(tele_buf)) {
+          // Use IT (Interrupt) to prevent blocking the main loop
+          // If the previous transmission hasn't finished, this returns HAL_BUSY and skips
+          HAL_UART_Transmit_IT(&huart2, (uint8_t*)tele_buf, len);
+      }
     }
-
-    TM1638_SendDMA(display_str, led_mask);
-
-    HAL_Delay(50);
+    
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

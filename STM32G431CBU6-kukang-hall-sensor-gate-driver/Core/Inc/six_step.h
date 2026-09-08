@@ -18,5 +18,10 @@ void SixStep_Stop(void);
 
 // Print debug info
 void SixStep_PrintVerbose(void);
+void SixStep_PrintVerbose(void);
+void SixStep_PrintDebug(void);
+
+// FOC support
+float SixStep_GetElectricalAngle(void);
 
 #endif // SIX_STEP_H

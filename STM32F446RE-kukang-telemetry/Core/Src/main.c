@@ -31,6 +31,7 @@
 #include "config.h"
 #include "cli.h"
 #include "speed.h"
+#include "ds18b20.h"
 
 /* USER CODE END Includes */
 
@@ -62,9 +63,11 @@ DMA_HandleTypeDef hdma_spi2_tx;
 
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim5;
+TIM_HandleTypeDef htim14;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
 UART_HandleTypeDef huart6;
 
 /* USER CODE BEGIN PV */
@@ -86,6 +89,8 @@ static void MX_SPI2_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_USART6_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_TIM14_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -159,7 +164,10 @@ int main(void)
   MX_USART6_UART_Init();
   MX_USB_DEVICE_Init();
   MX_FATFS_Init();
+  MX_USART3_UART_Init();
+  MX_TIM14_Init();
   /* USER CODE BEGIN 2 */
+  HAL_TIM_Base_Start(&htim14); // Start Timer 14 for microsecond delays
   CAN_FilterTypeDef canfilterconfig;
 
   canfilterconfig.FilterBank = 0;
@@ -216,6 +224,11 @@ int main(void)
   BMP280_Data bmp_data = {0};
   MPU9250_Data imu_data = {0};
   GPS_Data gps_data = {0};
+  
+  DS18B20_Device ds18b20_devs[2];
+  uint8_t num_ds18b20 = DS18B20_Search(GPIOB, GPIO_PIN_10, ds18b20_devs, 2);
+  uint32_t last_temp_req = 0;
+  uint8_t temp_req_pending = 0;
 
 #pragma pack(push, 1)
   typedef struct {
@@ -257,6 +270,21 @@ int main(void)
     
     uint32_t current_tick = HAL_GetTick();
     
+    // --- DS18B20 Async State Machine ---
+    if (num_ds18b20 > 0) {
+      if (!temp_req_pending && current_tick - last_temp_req >= 1000) {
+        DS18B20_StartAll(GPIOB, GPIO_PIN_10);
+        last_temp_req = current_tick;
+        temp_req_pending = 1;
+      } else if (temp_req_pending && current_tick - last_temp_req >= 800) {
+        for (int i = 0; i < num_ds18b20; i++) {
+          ds18b20_devs[i].temperature = DS18B20_ReadTemp(GPIOB, GPIO_PIN_10, ds18b20_devs[i].rom_code);
+        }
+        temp_req_pending = 0;
+        last_temp_req = current_tick;
+      }
+    }
+
     // --- Logging Task (Configurable Interval) ---
     // Must run BEFORE UI Task to prevent SDIO FIFO polling from colliding with SPI2 DMA!
     if (is_logging) {
@@ -345,17 +373,17 @@ int main(void)
 
     // Check buttons (S8 = 0x80, S7 = 0x40, S6 = 0x20, S5 = 0x10)
     if (buttons != prev_buttons) {
-      if ((buttons & 0x80) && !(prev_buttons & 0x80)) { // S8: Accel
+      if ((buttons & 0x80) && !(prev_buttons & 0x80)) { // S8: Accel & Gyro
         if (display_mode == 0)
-          sub_mode = (sub_mode + 1) % 3;
+          sub_mode = (sub_mode + 1) % 6;
         else {
           display_mode = 0;
           sub_mode = 0;
         }
       }
-      if ((buttons & 0x40) && !(prev_buttons & 0x40)) { // S7: Gyro
+      if ((buttons & 0x40) && !(prev_buttons & 0x40)) { // S7: Temperatures
         if (display_mode == 1)
-          sub_mode = (sub_mode + 1) % 3;
+          sub_mode = (sub_mode + 1) % (1 + num_ds18b20);
         else {
           display_mode = 1;
           sub_mode = 0;
@@ -427,23 +455,29 @@ int main(void)
     }
 
     switch (display_mode) {
-    case 0:                     // Accel
-      led_mask = 1 << sub_mode; // LED 1, 2, or 3
+    case 0:                     // Accel & Gyro
+      led_mask = 1 << sub_mode; 
       if (sub_mode == 0)
-        sprintf(display_str, "%8.3f", imu_data.accel_x);
+        sprintf(display_str, "Ax %5.2f", imu_data.accel_x);
       else if (sub_mode == 1)
-        sprintf(display_str, "%8.3f", imu_data.accel_y);
+        sprintf(display_str, "Ay %5.2f", imu_data.accel_y);
       else if (sub_mode == 2)
-        sprintf(display_str, "%8.3f", imu_data.accel_z);
+        sprintf(display_str, "Az %5.2f", imu_data.accel_z);
+      else if (sub_mode == 3)
+        sprintf(display_str, "gx %5.1f", imu_data.gyro_x);
+      else if (sub_mode == 4)
+        sprintf(display_str, "gy %5.1f", imu_data.gyro_y);
+      else if (sub_mode == 5)
+        sprintf(display_str, "gz %5.1f", imu_data.gyro_z);
       break;
-    case 1: // Gyro
+    case 1: // Temperatures
       led_mask = 1 << sub_mode;
       if (sub_mode == 0)
-        sprintf(display_str, "%8.1f", imu_data.gyro_x);
-      else if (sub_mode == 1)
-        sprintf(display_str, "%8.1f", imu_data.gyro_y);
-      else if (sub_mode == 2)
-        sprintf(display_str, "%8.1f", imu_data.gyro_z);
+        sprintf(display_str, "b %6.2f", bmp_data.temperature);
+      else if (sub_mode == 1 && num_ds18b20 > 0)
+        sprintf(display_str, "d1%6.2f", ds18b20_devs[0].temperature);
+      else if (sub_mode == 2 && num_ds18b20 > 1)
+        sprintf(display_str, "d2%6.2f", ds18b20_devs[1].temperature);
       break;
     case 2:                                             // Baro (Altitude)
       led_mask = 0x10;                                  // LED 5
@@ -859,6 +893,37 @@ static void MX_TIM5_Init(void)
 }
 
 /**
+  * @brief TIM14 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM14_Init(void)
+{
+
+  /* USER CODE BEGIN TIM14_Init 0 */
+
+  /* USER CODE END TIM14_Init 0 */
+
+  /* USER CODE BEGIN TIM14_Init 1 */
+
+  /* USER CODE END TIM14_Init 1 */
+  htim14.Instance = TIM14;
+  htim14.Init.Prescaler = (SystemCoreClock / 1000000) - 1;
+  htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim14.Init.Period = 65535;
+  htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM14_Init 2 */
+
+  /* USER CODE END TIM14_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -931,6 +996,39 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_HalfDuplex_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
 
 }
 

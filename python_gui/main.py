@@ -223,18 +223,22 @@ class FOCGUI(QMainWindow):
         self.p_vq = self.graph_layout.addPlot(title="Target vs Actual Duty")
         self.p_vq.showGrid(x=True, y=True)
         self.p_vq.addLegend()
-        self.curve_vq_t = self.p_vq.plot(pen=dash_pen, name="Target", antialias=True)
-        self.curve_vq = self.p_vq.plot(pen='r', name="Actual", antialias=True)
+        # Target vs Actual Iq Plot
+        self.p_duty = self.graph_layout.addPlot(title="Target vs Actual Iq (A)")
+        self.p_duty.showGrid(x=True, y=True)
+        self.p_duty.addLegend()
+        self.curve_duty_target = self.p_duty.plot(pen=pg.mkPen('r', width=1.5, style=Qt.DashLine), name="Target Iq", antialias=True)
+        self.curve_duty_actual = self.p_duty.plot(pen=pg.mkPen('y', width=2), name="Actual Iq (LPF)", antialias=True)
         
         self.graph_layout.nextRow()
         
         # Phase Currents Plot
-        self.p_phase = self.graph_layout.addPlot(title="Phase PWM Duty (U, V, W %)")
+        self.p_phase = self.graph_layout.addPlot(title="Phase Current (U, V, W Amperes)")
         self.p_phase.showGrid(x=True, y=True)
         self.p_phase.addLegend()
-        self.curve_ia = self.p_phase.plot(pen=pg.mkPen('r', width=1.5), name="Duty U", antialias=True)
-        self.curve_ib = self.p_phase.plot(pen=pg.mkPen('g', width=1.5), name="Duty V", antialias=True)
-        self.curve_ic = self.p_phase.plot(pen=pg.mkPen('b', width=1.5), name="Duty W", antialias=True)
+        self.curve_ia = self.p_phase.plot(pen=pg.mkPen('r', width=1.5), name="Current U", antialias=True)
+        self.curve_ib = self.p_phase.plot(pen=pg.mkPen('g', width=1.5), name="Current V", antialias=True)
+        self.curve_ic = self.p_phase.plot(pen=pg.mkPen('b', width=1.5), name="Current W", antialias=True)
         
         # Bottom Bar: Terminal
         self.terminal = QPlainTextEdit()
@@ -396,14 +400,14 @@ class FOCGUI(QMainWindow):
     def update_plots(self):
         if self.new_data_available:
             self.curve_vel.setData(self.vel_data)
-            self.curve_vq.setData(self.vq_data)
+            self.curve_duty_actual.setData(self.vq_data)
             self.curve_ia.setData(self.ia_data)
             self.curve_ib.setData(self.ib_data)
             self.curve_ic.setData(self.ic_data)
             
             # Always show target on Vq for duty target
             empty = []
-            self.curve_vq_t.setData(self.target_data)
+            self.curve_duty_target.setData(self.target_data)
             self.curve_vel_t.setData(empty)
                 
             self.new_data_available = False

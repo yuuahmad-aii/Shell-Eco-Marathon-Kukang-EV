@@ -92,7 +92,22 @@ void SixStep_SetRPM(float setpoint_rpm) {
             // Wait 5ms to fully charge bootstrap capacitors
             HAL_Delay(5);
             
-            // Disable phases before starting commutation
+            // --- SINGLE ALIGNMENT (STARTUP) ---
+            if (motor_config.startup_align_ms > 0) {
+                // Apply a static vector: Phase U high, V low, W float
+                uint32_t align_ccr = (uint32_t)((motor_config.startup_align_duty / 100.0f) * htim1.Instance->ARR);
+                htim1.Instance->CCR1 = align_ccr;
+                htim1.Instance->CCR2 = 0;
+                htim1.Instance->CCR3 = 0;
+                
+                ENABLE_PHASE_U();
+                ENABLE_PHASE_V();
+                DISABLE_PHASE_W();
+                
+                HAL_Delay(motor_config.startup_align_ms);
+            }
+            
+            // Disable phases before starting normal commutation
             DISABLE_PHASE_U();
             DISABLE_PHASE_V();
             DISABLE_PHASE_W();
@@ -390,7 +405,43 @@ void SixStep_PrintVerbose(void) {
     uint8_t mode = motor_running ? (svpwm_mode ? 2 : 1) : 0;
     
     // Send binary to GUI
-    // We send: pos=interpolated_angle, vel=rpm, vq=current_duty, target=current_duty, 
-    // ia=duty_u, ib=duty_v, ic=duty_w, mode=mode
-    Telemetry_SendBinary(interpolated_angle, rpm, current_duty, current_duty, duty_u, duty_v, duty_w, mode);
+    // We send: pos=interpolated_angle, vel=rpm, vq=actual_iq, target=target_iq, 
+    // ia=current_u, ib=current_v, ic=current_w, mode=mode
+    extern float Get_Current_U(void);
+    extern float Get_Current_V(void);
+    extern float Get_Current_W(void);
+    extern float Get_Current_Iq(void);
+    
+    // For now, target_iq is mapped from current_duty until the PI controller is implemented
+    float target_iq = current_duty; 
+    
+    Telemetry_SendBinary(interpolated_angle, rpm, Get_Current_Iq(), target_iq, Get_Current_U(), Get_Current_V(), Get_Current_W(), mode);
+}
+
+void SixStep_PrintDebug(void) {
+    uint8_t h_state = Get_Hall_State();
+    uint8_t h1 = (h_state & 1) ? 1 : 0;
+    uint8_t h2 = (h_state & 2) ? 1 : 0;
+    uint8_t h3 = (h_state & 4) ? 1 : 0;
+    
+    cdc_printf("Hall Sensors: H1(PA0)=%d H2(PA1)=%d H3(PA2)=%d [State=%d]\r\n", h1, h2, h3, h_state);
+    
+    uint32_t ccer = htim1.Instance->CCER;
+    uint8_t uh = (ccer & TIM_CCER_CC1E) ? 1 : 0;
+    uint8_t ul = (ccer & TIM_CCER_CC1NE) ? 1 : 0;
+    uint8_t vh = (ccer & TIM_CCER_CC2E) ? 1 : 0;
+    uint8_t vl = (ccer & TIM_CCER_CC2NE) ? 1 : 0;
+    uint8_t wh = (ccer & TIM_CCER_CC3E) ? 1 : 0;
+    uint8_t wl = (ccer & TIM_CCER_CC3NE) ? 1 : 0;
+    
+    cdc_printf("MOSFET Gates: UH=%d UL=%d | VH=%d VL=%d | WH=%d WL=%d\r\n", uh, ul, vh, vl, wh, wl);
+    
+    extern float Get_Current_U(void);
+    extern float Get_Current_V(void);
+    extern float Get_Current_W(void);
+    cdc_printf("Current (ACS712): U=%.2f A | V=%.2f A | W=%.2f A\r\n", Get_Current_U(), Get_Current_V(), Get_Current_W());
+}
+
+float SixStep_GetElectricalAngle(void) {
+    return interpolated_angle;
 }

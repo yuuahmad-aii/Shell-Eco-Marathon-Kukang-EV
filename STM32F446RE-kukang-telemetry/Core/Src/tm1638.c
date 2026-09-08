@@ -89,6 +89,18 @@ void TM1638_SendDMA(const char *str, uint8_t leds) {
         seg_data = 0x38;
       else if (c == 'T' || c == 't')
         seg_data = 0x78;
+      else if (c == 'G' || c == 'g')
+        seg_data = 0x6F; // Looks like 9
+      else if (c == 'Y' || c == 'y')
+        seg_data = 0x6E;
+      else if (c == 'Z' || c == 'z')
+        seg_data = 0x5B; // Looks like 2
+      else if (c == 'U' || c == 'u')
+        seg_data = 0x3E;
+      else if (c == 'V' || c == 'v')
+        seg_data = 0x1C;
+      else if (c == 'W' || c == 'w')
+        seg_data = 0x2A;
       else if (c == '-')
         seg_data = 0x40;
       else if (c == ' ')

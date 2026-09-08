@@ -79,6 +79,8 @@ void Config_LoadDefaults(void) {
   motor_config.vel_ki = 0.1f;
   motor_config.accel_rpm_s = 500.0f;
   motor_config.invert_direction = 0;
+  motor_config.startup_align_duty = 5.0f;
+  motor_config.startup_align_ms = 300;
 
   memset(motor_config.reserved, 0, sizeof(motor_config.reserved));
 }
@@ -200,6 +202,13 @@ void Config_PrintAll(void) {
   cdc_printf("$13=%d.%d (Accel RPM/s)\r\n", arpms_i, arpms_f);
   
   cdc_printf("$14=%lu (Invert Direction: 0=Normal, 1=Inverted)\r\n", motor_config.invert_direction);
+  
+  int align_duty_i = (int)motor_config.startup_align_duty,
+      align_duty_f = (int)(motor_config.startup_align_duty * 10) % 10;
+  if (align_duty_f < 0) align_duty_f = -align_duty_f;
+  cdc_printf("$15=%d.%d (Startup Align Duty %%)\r\n", align_duty_i, align_duty_f);
+  
+  cdc_printf("$16=%lu (Startup Align Duration ms)\r\n", motor_config.startup_align_ms);
 
   cdc_printf("ok\r\n");
 }
@@ -209,6 +218,7 @@ void Config_PrintHelp(void) {
   cdc_printf("$$      : Show all settings\r\n");
   cdc_printf("$x=y    : Set parameter x to value y\r\n");
   cdc_printf("$save   : Save settings to flash\r\n");
+  cdc_printf("$?      : Show Hall & MOSFET states\r\n");
   cdc_printf("$h      : Show this help\r\n");
   cdc_printf("S<val>  : Set Target Duty Cycle (%)\r\n");
   cdc_printf("T       : Stop Motor\r\n");
@@ -221,6 +231,9 @@ void Config_ParseCommand(char *cmd_line) {
       Config_PrintAll();
     } else if (strncmp(&cmd_line[1], "save", 4) == 0) {
       Config_Save();
+    } else if (cmd_line[1] == '?') {
+      extern void SixStep_PrintDebug(void);
+      SixStep_PrintDebug();
     } else if (cmd_line[1] == 'h') {
       Config_PrintHelp();
     } else {
@@ -253,6 +266,8 @@ void Config_ParseCommand(char *cmd_line) {
         case 12: motor_config.vel_ki = atof(val_str); break;
         case 13: motor_config.accel_rpm_s = atof(val_str); break;
         case 14: motor_config.invert_direction = atoi(val_str); break;
+        case 15: motor_config.startup_align_duty = atof(val_str); break;
+        case 16: motor_config.startup_align_ms = atoi(val_str); break;
         default:
           cdc_printf("error: Invalid parameter\r\n");
           return;

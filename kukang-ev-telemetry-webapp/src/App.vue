@@ -18,17 +18,57 @@
           Upload Log (.bin / .csv)
           <input type="file" accept=".bin,.csv" @change="handleFileUpload" hidden />
         </label>
-        <label class="file-upload-btn" style="background-color: var(--secondary); color: #fff;">
+        <label class="file-upload-btn" style="background-color: var(--secondary); color: #fff;" v-if="activeTab === 'vehicle'">
           Convert .bin to .csv
           <input type="file" accept=".bin" @change="convertBinToCsv" hidden />
         </label>
-        <div class="status" :class="isConnected ? 'status-connected' : 'status-disconnected'">
+        <div class="status" :class="isConnected ? 'status-connected' : 'status-disconnected'" v-if="activeTab === 'vehicle'">
           {{ isConnected ? 'Live Connection' : (isOfflineMode ? 'Offline Log Mode' : 'Connecting...') }}
         </div>
+        
+        <button 
+          class="file-upload-btn" 
+          @click="toggleSerialConnection"
+          :style="{ backgroundColor: isSerialConnected ? 'var(--warning)' : 'var(--accent-primary)', color: isSerialConnected ? '#000' : '#fff' }"
+          v-if="activeTab === 'motor'"
+        >
+          {{ isSerialConnected ? 'Disconnect USB' : 'Connect USB Motor' }}
+        </button>
+        <div class="status" :class="isSerialConnected ? 'status-connected' : 'status-disconnected'" v-if="activeTab === 'motor'">
+          {{ isSerialConnected ? 'USB Serial Connected' : 'Disconnected' }}
+        </div>
+        
+        <button class="file-upload-btn" @click="isSidebarOpen = true" style="background-color: var(--accent-primary); font-size: 14px; padding: 6px 12px; margin-left: 10px;">
+          ☰ Menu
+        </button>
       </div>
     </header>
 
-    <main class="dashboard-grid">
+    <!-- Sidebar Overlay -->
+    <div v-if="isSidebarOpen" class="sidebar-overlay" @click="isSidebarOpen = false"></div>
+    
+    <!-- Sidebar -->
+    <div class="sidebar" :class="{ 'sidebar-open': isSidebarOpen }">
+      <div class="sidebar-header">
+        <h2>Menu</h2>
+        <button class="close-btn" @click="isSidebarOpen = false">✖</button>
+      </div>
+      <div class="sidebar-content">
+        <h3>Telemetry Modes</h3>
+        <button class="tab-btn" style="width: 100%; margin-bottom: 10px; text-align: left;" :class="{active: activeTab === 'vehicle'}" @click="activeTab = 'vehicle'; isSidebarOpen = false">🌍 Vehicle Telemetry</button>
+        <button class="tab-btn" style="width: 100%; margin-bottom: 30px; text-align: left;" :class="{active: activeTab === 'motor'}" @click="activeTab = 'motor'; isSidebarOpen = false">⚡ Motor Telemetry</button>
+        
+        <div class="sidebar-info">
+          <h3>Web App Info</h3>
+          <p><strong>App Name:</strong> Kukang EV Telemetry Dashboard</p>
+          <p><strong>Stack:</strong> Vue 3, Vite, ApexCharts, Leaflet, Web Serial API</p>
+          <p><strong>Authors:</strong> yuuahmad + Gemini AI</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- VEHICLE TELEMETRY -->
+    <main class="dashboard-grid" v-show="activeTab === 'vehicle'">
       <!-- Left Column: Map -->
       <div class="map-column">
         <div class="chart-card map-card">
@@ -71,6 +111,63 @@
       </div>
     </main>
   </div>
+<!-- MOTOR TELEMETRY -->
+    <main class="dashboard-grid" style="grid-template-columns: 1fr;" v-show="activeTab === 'motor'">
+      <div class="charts-column" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+        <!-- Q1: Target vs Actual Iq -->
+        <div class="chart-card" style="display:flex; flex-direction:row; gap:10px; align-items:center;">
+          <div style="flex:1;">
+            <div class="chart-title">Target vs Actual Iq (A)</div>
+            <apexchart type="line" height="280" :options="motorIqOptions" :series="motorIqSeries"></apexchart>
+          </div>
+          <div style="width:90px; display:flex; flex-direction:column; gap:5px; font-size:11px; color:#94a3b8;">
+             <label>Y Max <input type="number" v-model="iqYMax" class="axis-input"></label>
+             <label>Y Min <input type="number" v-model="iqYMin" class="axis-input"></label>
+             <label>X Max (s) <input type="number" v-model="iqXMax" class="axis-input"></label>
+             <label>X Min (s) <input type="number" v-model="iqXMin" class="axis-input"></label>
+          </div>
+        </div>
+
+        <!-- Q2: Velocity -->
+        <div class="chart-card" style="display:flex; flex-direction:row; gap:10px; align-items:center;">
+          <div style="flex:1;">
+            <div class="chart-title">Electrical Velocity (RPM)</div>
+            <apexchart type="line" height="280" :options="motorVelOptions" :series="motorVelSeries"></apexchart>
+          </div>
+          <div style="width:90px; display:flex; flex-direction:column; gap:5px; font-size:11px; color:#94a3b8;">
+             <label>Y Max <input type="number" v-model="velYMax" class="axis-input"></label>
+             <label>Y Min <input type="number" v-model="velYMin" class="axis-input"></label>
+             <label>X Max (s) <input type="number" v-model="velXMax" class="axis-input"></label>
+             <label>X Min (s) <input type="number" v-model="velXMin" class="axis-input"></label>
+          </div>
+        </div>
+
+        <!-- Q3: Phase Current -->
+        <div class="chart-card" style="display:flex; flex-direction:row; gap:10px; align-items:center;">
+          <div style="flex:1;">
+            <div class="chart-title">Phase Current (U, V, W Amperes)</div>
+            <apexchart type="line" height="280" :options="motorPhaseOptions" :series="motorPhaseSeries"></apexchart>
+          </div>
+          <div style="width:90px; display:flex; flex-direction:column; gap:5px; font-size:11px; color:#94a3b8;">
+             <label>Y Max <input type="number" v-model="phaseYMax" class="axis-input"></label>
+             <label>Y Min <input type="number" v-model="phaseYMin" class="axis-input"></label>
+             <label>X Max (s) <input type="number" v-model="phaseXMax" class="axis-input"></label>
+             <label>X Min (s) <input type="number" v-model="phaseXMin" class="axis-input"></label>
+          </div>
+        </div>
+        
+        <!-- Q4: Terminal -->
+        <div class="chart-card" style="display:flex; flex-direction:column;">
+          <div class="chart-title">Serial Terminal</div>
+          <textarea readonly class="terminal-output" ref="terminalOutput" :value="terminalText" style="flex:1; width:100%; height:230px; background:#1e293b; color:#10b981; font-family:monospace; padding:10px; border-radius:5px; border:1px solid #334155; margin-bottom:10px; resize:none;"></textarea>
+          <div style="display:flex; gap:10px;">
+            <input type="text" v-model="cmdInput" @keyup.enter="sendSerialCommand" style="flex:1; padding:10px; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:5px; font-family:monospace;" placeholder="Type command (e.g. s300, $?) and press Enter...">
+            <button class="file-upload-btn" @click="sendSerialCommand">Send</button>
+            <button class="file-upload-btn" style="background:#334155" @click="terminalText = ''">Clear</button>
+          </div>
+        </div>
+      </div>
+    </main>
 </template>
 
 <script setup>
@@ -78,6 +175,28 @@ import { ref, shallowRef, onMounted, computed, nextTick } from 'vue'
 import { db, ref as dbRef, onValue } from './firebase'
 import 'leaflet/dist/leaflet.css'
 import L from 'leaflet'
+
+const activeTab = ref('vehicle')
+const isSidebarOpen = ref(false)
+
+// Motor Telemetry State
+const isSerialConnected = ref(false)
+let serialPort = null
+let serialReader = null
+let serialWriter = null
+let keepSerialReading = false
+
+const motorTime = shallowRef([])
+const motorVel = shallowRef([])
+const motorVq = shallowRef([])
+const motorTarget = shallowRef([])
+const motorIa = shallowRef([])
+const motorIb = shallowRef([])
+const motorIc = shallowRef([])
+
+const terminalText = ref('')
+const cmdInput = ref('')
+const terminalOutput = ref(null)
 
 const isConnected = ref(false)
 const isOfflineMode = ref(false)
@@ -225,16 +344,245 @@ const speedSeries = computed(() => [
   { name: 'Speed', data: speedHistory.value, color: '#F43F5E' } // Rose red
 ])
 
+const velYMax = ref(100)
+const velYMin = ref(-100)
+const velXMax = ref(0)
+const velXMin = ref(-5)
+
+const iqYMax = ref(10)
+const iqYMin = ref(-10)
+const iqXMax = ref(0)
+const iqXMin = ref(-5)
+
+const phaseYMax = ref(10)
+const phaseYMin = ref(-10)
+const phaseXMax = ref(0)
+const phaseXMin = ref(-5)
+
 const gpsOptions = buildOptions('gps', [
   { seriesName: 'Satellites', title: { text: 'Satellites' }, min: 0, tickAmount: 4 },
   { opposite: true, seriesName: 'PDOP', title: { text: 'PDOP' }, min: 0, tickAmount: 4 }
 ])
 const gpsSeries = computed(() => [
-  { name: 'Satellites', data: satsHistory.value, color: '#F472B6' }, // Pink
-  { name: 'PDOP', data: pdopHistory.value, color: '#E2E8F0' }        // White-ish
+  { name: 'Satellites', data: satsHistory.value, color: '#F472B6' },
+  { name: 'PDOP', data: pdopHistory.value, color: '#E2E8F0' }
 ])
 
-// Recording Handler
+const buildMotorOptions = (id, yAxisConfig, xMinRef, xMaxRef) => {
+  return computed(() => {
+    return {
+      chart: { id, group: 'motor-sync', type: 'line', animations: { enabled: false }, toolbar: { show: false }, background: 'transparent', foreColor: '#e2e8f0' },
+      stroke: { width: 2, curve: 'straight' },
+      xaxis: { 
+        type: 'numeric',
+        min: Number(xMinRef.value),
+        max: Number(xMaxRef.value),
+        tickAmount: 6,
+        labels: { formatter: (val) => val.toFixed(1) + 's' } 
+      },
+      yaxis: { 
+        title: yAxisConfig.title,
+        min: Number(yAxisConfig.min.value),
+        max: Number(yAxisConfig.max.value),
+        decimalsInFloat: 2, 
+        tickAmount: 4 
+      },
+      grid: { borderColor: '#334155', strokeDashArray: 3 },
+      legend: { position: 'top', horizontalAlign: 'left', offsetX: 10 },
+      theme: { mode: 'dark' },
+      dataLabels: { enabled: false }
+    }
+  })
+}
+
+const motorVelOptions = buildMotorOptions('motor-vel', { title: { text: 'RPM' }, min: velYMin, max: velYMax }, velXMin, velXMax)
+const motorVelSeries = computed(() => [
+  { name: 'Velocity', data: motorVel.value, color: '#3B82F6' }
+])
+
+const motorIqOptions = buildMotorOptions('motor-iq', { title: { text: 'Amperes' }, min: iqYMin, max: iqYMax }, iqXMin, iqXMax)
+const motorIqSeries = computed(() => [
+  { name: 'Target Iq', data: motorTarget.value, color: '#EF4444' },
+  { name: 'Actual Iq (LPF)', data: motorVq.value, color: '#F59E0B' }
+])
+
+const motorPhaseOptions = buildMotorOptions('motor-phase', { title: { text: 'Amperes' }, min: phaseYMin, max: phaseYMax }, phaseXMin, phaseXMax)
+const motorPhaseSeries = computed(() => [
+  { name: 'Current U', data: motorIa.value, color: '#EF4444' },
+  { name: 'Current V', data: motorIb.value, color: '#10B981' },
+  { name: 'Current W', data: motorIc.value, color: '#3B82F6' }
+])
+
+// Web Serial Logic
+const appendToTerminal = (text) => {
+  terminalText.value += text + '\n'
+  nextTick(() => {
+    if (terminalOutput.value) {
+      terminalOutput.value.scrollTop = terminalOutput.value.scrollHeight
+    }
+  })
+}
+
+const sendSerialCommand = async () => {
+  if (!serialWriter) return
+  if (!cmdInput.value) return
+  
+  const cmd = cmdInput.value + '\r\n'
+  appendToTerminal('> ' + cmdInput.value)
+  cmdInput.value = ''
+  
+  try {
+    const encoder = new TextEncoder()
+    await serialWriter.write(encoder.encode(cmd))
+  } catch (err) {
+    console.error("Write error:", err)
+    appendToTerminal("Error writing to serial port")
+  }
+}
+
+let motorPendingBuffer = new Uint8Array(0)
+const motorDataBuffer = {
+  time: [], vel: [], vq: [], target: [], ia: [], ib: [], ic: []
+}
+
+setInterval(() => {
+  if (isSerialConnected.value && motorDataBuffer.time.length > 0) {
+    const latestTime = motorDataBuffer.time[motorDataBuffer.time.length - 1];
+    const mapData = (arr) => arr.map(pt => [(pt[0] - latestTime) / 1000, pt[1]]);
+    
+    motorTime.value = [...motorDataBuffer.time]
+    motorVel.value = mapData(motorDataBuffer.vel)
+    motorVq.value = mapData(motorDataBuffer.vq)
+    motorTarget.value = mapData(motorDataBuffer.target)
+    motorIa.value = mapData(motorDataBuffer.ia)
+    motorIb.value = mapData(motorDataBuffer.ib)
+    motorIc.value = mapData(motorDataBuffer.ic)
+  }
+}, 100)
+
+const processSerialBinary = (buffer) => {
+  const MAX_MOTOR_PTS = 2000 
+  let offset = 0
+  let textOut = ""
+  
+  while (offset <= buffer.length - 33) {
+    if (buffer[offset] === 0xAA && buffer[offset+1] === 0xBB) {
+      if (buffer[offset+32] === 0x55) {
+        let crc = 0;
+        for(let i=2; i<=30; i++) crc ^= buffer[offset+i];
+        
+        if (crc === buffer[offset+31]) {
+          const view = new DataView(buffer.buffer, buffer.byteOffset + offset + 2, 28)
+          const pos = view.getFloat32(0, true)
+          const vel = view.getFloat32(4, true)
+          const vq = view.getFloat32(8, true)
+          const target = view.getFloat32(12, true)
+          const ia = view.getFloat32(16, true)
+          const ib = view.getFloat32(20, true)
+          const ic = view.getFloat32(24, true)
+          
+          const tStr = Date.now()
+          motorDataBuffer.time.push(tStr)
+          motorDataBuffer.vel.push([tStr, vel])
+          motorDataBuffer.vq.push([tStr, vq])
+          motorDataBuffer.target.push([tStr, target])
+          motorDataBuffer.ia.push([tStr, ia])
+          motorDataBuffer.ib.push([tStr, ib])
+          motorDataBuffer.ic.push([tStr, ic])
+          
+          if (motorDataBuffer.time.length > MAX_MOTOR_PTS) {
+            motorDataBuffer.time.shift()
+            motorDataBuffer.vel.shift()
+            motorDataBuffer.vq.shift()
+            motorDataBuffer.target.shift()
+            motorDataBuffer.ia.shift()
+            motorDataBuffer.ib.shift()
+            motorDataBuffer.ic.shift()
+          }
+          
+          offset += 33;
+          continue;
+        }
+      }
+    }
+    
+    const b = buffer[offset];
+    if ((b >= 32 && b <= 126) || b === 10 || b === 13) {
+       textOut += String.fromCharCode(b);
+    }
+    offset++;
+  }
+  
+  if (textOut.length > 0) {
+      terminalText.value += textOut;
+      nextTick(() => {
+        if (terminalOutput.value) terminalOutput.value.scrollTop = terminalOutput.value.scrollHeight
+      })
+  }
+  
+  return buffer.slice(offset);
+}
+
+const toggleSerialConnection = async () => {
+  if (isSerialConnected.value) {
+    keepSerialReading = false
+    if (serialReader) {
+      await serialReader.cancel()
+    }
+    isSerialConnected.value = false
+    appendToTerminal("Disconnected from USB")
+    return
+  }
+  
+  try {
+    serialPort = await navigator.serial.requestPort()
+    await serialPort.open({ baudRate: 115200 })
+    
+    isSerialConnected.value = true
+    keepSerialReading = true
+    appendToTerminal("Connected to STM32 USB Serial")
+    
+    serialWriter = serialPort.writable.getWriter()
+    
+    readLoop()
+    
+  } catch (err) {
+    console.error("Serial Connection Error:", err)
+    appendToTerminal("Failed to connect: " + err.message)
+  }
+}
+
+async function readLoop() {
+  while (serialPort.readable && keepSerialReading) {
+    serialReader = serialPort.readable.getReader()
+    try {
+      while (true) {
+        const { value, done } = await serialReader.read()
+        if (done) break
+        if (value) {
+          const merged = new Uint8Array(motorPendingBuffer.length + value.length)
+          merged.set(motorPendingBuffer)
+          merged.set(value, motorPendingBuffer.length)
+          
+          motorPendingBuffer = processSerialBinary(merged)
+        }
+      }
+    } catch (error) {
+      console.error("Read Error:", error)
+      break
+    } finally {
+      serialReader.releaseLock()
+    }
+  }
+  
+  if (serialWriter) {
+      serialWriter.releaseLock()
+      serialWriter = null
+  }
+  await serialPort.close()
+  isSerialConnected.value = false
+}
+
 const toggleRecording = () => {
   if (isRecording.value) {
     if (recordedData.value.length === 0) {
@@ -263,6 +611,8 @@ const toggleRecording = () => {
     isRecording.value = true
   }
 }
+
+
 
 // File Upload Handler (Offline Data)
 const convertBinToCsv = async (event) => {
@@ -488,71 +838,51 @@ const initMap = () => {
   });
 }
 
+
 onMounted(() => {
   initMap()
-  
-  // Firebase Live Telemetry
   const telemetryRef = dbRef(db, 'telemetry')
   onValue(telemetryRef, (snapshot) => {
-    if (isOfflineMode.value) return // Disable live updates if a file is loaded
-    
+    if (isOfflineMode.value) return 
     const data = snapshot.val()
     if (data) {
       isConnected.value = true
-      
-      // Watchdog Timer: Jika 3 detik tidak ada data baru, anggap terputus
       if (connectionTimeout) clearTimeout(connectionTimeout)
       connectionTimeout = setTimeout(() => {
         isConnected.value = false
       }, 3000)
-      
-      const MAX_PTS = 120 // ~1 minute at 2Hz
-      
-      // Gunakan timestamp dari mikrokontroler (dalam detik) agar grafik numeric x-axis berfungsi
+      const MAX_PTS = 120 
       const t = data.ts ? (data.ts / 1000) : (Date.now() / 1000)
-      
-      // Calculate speed
       let speed = 0
       if (liveLats.value.length > 0 && liveLons.value.length > 0 && timeHistory.value.length > 0) {
-         // Find the last valid GPS point to compute delta distance
          let lastValidIdx = liveLats.value.length - 1
          while (lastValidIdx >= 0 && (liveLats.value[lastValidIdx] === 0 || !liveLats.value[lastValidIdx])) {
            lastValidIdx--
          }
-         
          if (lastValidIdx >= 0 && data.lat && data.lon && data.lat !== 0 && data.lon !== 0) {
            const prevLat = liveLats.value[lastValidIdx]
            const prevLon = liveLons.value[lastValidIdx]
            const prevT = timeHistory.value[lastValidIdx]
-           
            const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, data.lat, data.lon)
            const dtSec = t - prevT
            if (dtSec > 0) speed = (distKm / dtSec) * 3600
          }
       }
       speedHistory.value = [...speedHistory.value, [t, speed]].slice(-MAX_PTS)
-      
       timeHistory.value = [...timeHistory.value, t].slice(-MAX_PTS)
-      
       accelX.value = [...accelX.value, [t, data.ax || 0]].slice(-MAX_PTS)
       accelY.value = [...accelY.value, [t, data.ay || 0]].slice(-MAX_PTS)
       accelZ.value = [...accelZ.value, [t, data.az || 0]].slice(-MAX_PTS)
-      
       gyroX.value = [...gyroX.value, [t, data.gx || 0]].slice(-MAX_PTS)
       gyroY.value = [...gyroY.value, [t, data.gy || 0]].slice(-MAX_PTS)
       gyroZ.value = [...gyroZ.value, [t, data.gz || 0]].slice(-MAX_PTS)
-      
       baroAlt.value = [...baroAlt.value, [t, data.alt || 0]].slice(-MAX_PTS)
       gpsAlt.value = [...gpsAlt.value, [t, data.galt || 0]].slice(-MAX_PTS)
       pdopHistory.value = [...pdopHistory.value, [t, data.pd || 0]].slice(-MAX_PTS)
       satsHistory.value = [...satsHistory.value, [t, data.ns || 0]].slice(-MAX_PTS)
-      
-      // Simpan history GPS untuk menggambar garis lintasan dan melacak titik hover
       liveLats.value = [...liveLats.value, data.lat || 0].slice(-MAX_PTS)
       liveLons.value = [...liveLons.value, data.lon || 0].slice(-MAX_PTS)
       updateMapPath(liveLats.value, liveLons.value)
-      
-      // Rekam data ke CSV jika mode record aktif
       if (isRecording.value) {
         recordedData.value.push({
           time: Date.now(),
@@ -566,3 +896,66 @@ onMounted(() => {
   })
 })
 </script>
+
+<style>
+.sidebar-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 999;
+}
+.sidebar {
+  position: fixed;
+  top: 0; right: -300px;
+  width: 300px; height: 100vh;
+  background: #1e293b;
+  box-shadow: -2px 0 10px rgba(0,0,0,0.5);
+  z-index: 1000;
+  transition: right 0.3s ease;
+  display: flex; flex-direction: column;
+}
+.sidebar-open {
+  right: 0;
+}
+.sidebar-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 20px;
+  border-bottom: 1px solid #334155;
+}
+.sidebar-header h2 { margin: 0; color: #f1f5f9; font-size: 1.2rem; }
+.close-btn {
+  background: transparent; border: none; color: #94a3b8; font-size: 1.5rem; cursor: pointer;
+}
+.close-btn:hover { color: #fff; }
+.sidebar-content { padding: 20px; flex: 1; }
+.sidebar-content h3 { color: #94a3b8; font-size: 0.9rem; text-transform: uppercase; margin-bottom: 15px; }
+.sidebar-info {
+  margin-top: auto;
+  padding: 15px;
+  background: #0f172a;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  color: #cbd5e1;
+}
+.sidebar-info p { margin: 5px 0; }
+.sidebar-info strong { color: #38bdf8; }
+
+.tab-container { margin-bottom: 10px; }
+.tab-btn { padding: 8px 16px; background: var(--secondary); color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+.tab-btn.active { background: var(--accent-primary); color: #000; }
+.chart-title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: #f1f5f9;
+  margin-bottom: 10px;
+}
+.axis-input {
+  width: 100%;
+  padding: 4px;
+  border-radius: 4px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  color: #fff;
+  margin-top: 2px;
+}
+</style>

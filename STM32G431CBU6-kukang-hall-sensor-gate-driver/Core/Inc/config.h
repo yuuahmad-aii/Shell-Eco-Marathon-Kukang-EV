@@ -33,8 +33,12 @@ typedef struct {
     float accel_rpm_s;           // $13: Acceleration Limit (RPM/s)
     uint32_t invert_direction;   // $14: Invert Motor Direction (0=Normal, 1=Inverted)
     
+    // Startup Sequence
+    float startup_align_duty;    // $15: Duty cycle for single alignment (0-100%)
+    uint32_t startup_align_ms;   // $16: Duration of single alignment in ms
+    
     // Future expansion space
-    uint32_t reserved[7];
+    uint32_t reserved[5];
 } motor_config_t;
 
 extern motor_config_t motor_config;

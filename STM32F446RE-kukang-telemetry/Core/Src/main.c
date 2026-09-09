@@ -67,7 +67,6 @@ TIM_HandleTypeDef htim14;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
-UART_HandleTypeDef huart3;
 UART_HandleTypeDef huart6;
 
 /* USER CODE BEGIN PV */
@@ -89,7 +88,6 @@ static void MX_SPI2_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_USART6_UART_Init(void);
-static void MX_USART3_UART_Init(void);
 static void MX_TIM14_Init(void);
 /* USER CODE BEGIN PFP */
 
@@ -103,6 +101,11 @@ uint8_t TxData[8];
 uint8_t RxData[8];
 uint32_t TxMailbox;
 
+volatile float can_vbus = 0.0f;
+volatile float can_actual_iq = 0.0f;
+volatile uint8_t can_motor_active = 0;
+volatile uint32_t last_can_motor_tick = 0;
+
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
   if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK) {
     Error_Handler();
@@ -110,6 +113,13 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
 
   if (RxHeader.StdId == 0x20) {
     HAL_GPIO_TogglePin(USER_LED_GPIO_Port, USER_LED_Pin);
+    can_motor_active = RxData[0];
+    uint16_t vbus_centi = (uint16_t)(RxData[1] | (RxData[2] << 8));
+    int16_t iq_centi = (int16_t)(RxData[3] | (RxData[4] << 8));
+
+    can_vbus = (float)vbus_centi / 100.0f;
+    can_actual_iq = (float)iq_centi / 100.0f;
+    last_can_motor_tick = HAL_GetTick();
   }
 }
 
@@ -191,7 +201,6 @@ int main(void) {
   MX_USART6_UART_Init();
   MX_USB_DEVICE_Init();
   MX_FATFS_Init();
-  MX_USART3_UART_Init();
   MX_TIM14_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_Base_Start(&htim14); // Start Timer 14 for microsecond delays
@@ -242,7 +251,11 @@ int main(void) {
   CLI_Init();
   Speed_Init();
 
-  uint8_t prev_buttons = 0;
+  uint8_t last_raw_buttons = 0;
+  uint8_t debounced_buttons = 0;
+  uint8_t prev_debounced_buttons = 0;
+  uint32_t last_btn_action_tick[8] = {0};
+
   char display_str[16];
 
   uint16_t motor_target_rpm = MOTOR_DEFAULT_RPM;
@@ -251,8 +264,14 @@ int main(void) {
   uint32_t btn3_hold_time = 0;
   uint32_t last_btn_repeat = 0;
 
-  uint8_t display_mode = 0; // 0=Set RPM, 1=Accel/Gyro, 2=Temp, 3=Baro, 4=GPS
-  uint8_t sub_mode = 0;     // 0=X/Lat, 1=Y/Lon, 2=Z
+  uint8_t display_mode = 0; // 0=Set RPM, 1=Accel/Gyro, 2=Temp/Baro, 3=GPS, 4=Motor/Efficiency
+  uint8_t sub_mode = 0;     // Sub-mode for current display_mode
+
+  float accumulated_distance_km = 0.0f;
+  float accumulated_energy_ws = 0.0f;
+  float accumulated_energy_kwh = 0.0f;
+  float km_per_kwh = 0.0f;
+  uint32_t last_energy_tick = 0;
 
   BMP280_Data bmp_data = {0};
   MPU9250_Data imu_data = {0};
@@ -409,16 +428,25 @@ int main(void) {
     if (current_tick - last_ui_tick >= 50) {
       last_ui_tick = current_tick;
 
-      uint8_t buttons = TM1638_ReadButtons();
+      // 1. Read and Debounce TM1638 Buttons
+      uint8_t raw_buttons = TM1638_ReadButtons();
+      // Require 2 consecutive matching 50ms samples to eliminate bounce/glitches
+      if (raw_buttons == last_raw_buttons) {
+        debounced_buttons = raw_buttons;
+      }
+      last_raw_buttons = raw_buttons;
+
+      // Detect rising edges (0 -> 1) and falling edges (1 -> 0)
+      uint8_t pressed_edges = debounced_buttons & ~prev_debounced_buttons;
+      uint8_t released_edges = ~debounced_buttons & prev_debounced_buttons;
 
       // --- Motor Throttle & Speed Controls ---
-      // Button 1 (S1 = 0x01): Throttle / Gas
-      uint8_t throttle_active = (buttons & 0x01) ? 1 : 0;
+      // Button 1 (S1 = 0x01): Throttle / Gas (Momentary)
+      uint8_t throttle_active = (debounced_buttons & 0x01) ? 1 : 0;
       if (throttle_active) {
         CAN_SendMotorControl(1, motor_target_rpm);
-      } else if (prev_buttons & 0x01) {
-        // Throttle just released: return display to Set RPM and send stop
-        // packets
+      } else if (released_edges & 0x01) {
+        // Throttle just released: return display to Set RPM and send stop packets
         display_mode = 0;
         CAN_SendMotorControl(0, 0);
         stop_packets_remaining = 3;
@@ -428,7 +456,8 @@ int main(void) {
       }
 
       // Button 2 (S2 = 0x02): Speed Down (Decrement target speed)
-      if ((buttons & 0x02) && !(prev_buttons & 0x02)) {
+      if ((pressed_edges & 0x02) && (current_tick - last_btn_action_tick[1] >= 200)) {
+        last_btn_action_tick[1] = current_tick;
         if (motor_target_rpm >= (MOTOR_RPM_MIN + MOTOR_RPM_STEP)) {
           motor_target_rpm -= MOTOR_RPM_STEP;
         } else {
@@ -436,7 +465,7 @@ int main(void) {
         }
         display_mode = 0; // Switch to Set RPM display
         btn2_hold_time = current_tick;
-      } else if ((buttons & 0x02) && (current_tick - btn2_hold_time > 400) &&
+      } else if ((debounced_buttons & 0x02) && (current_tick - btn2_hold_time > 400) &&
                  (current_tick - last_btn_repeat > 100)) {
         if (motor_target_rpm >= (MOTOR_RPM_MIN + MOTOR_RPM_STEP)) {
           motor_target_rpm -= MOTOR_RPM_STEP;
@@ -448,7 +477,8 @@ int main(void) {
       }
 
       // Button 3 (S3 = 0x04): Speed Up (Increment target speed)
-      if ((buttons & 0x04) && !(prev_buttons & 0x04)) {
+      if ((pressed_edges & 0x04) && (current_tick - last_btn_action_tick[2] >= 200)) {
+        last_btn_action_tick[2] = current_tick;
         if (motor_target_rpm + MOTOR_RPM_STEP <= MOTOR_RPM_MAX) {
           motor_target_rpm += MOTOR_RPM_STEP;
         } else {
@@ -456,7 +486,7 @@ int main(void) {
         }
         display_mode = 0; // Switch to Set RPM display
         btn3_hold_time = current_tick;
-      } else if ((buttons & 0x04) && (current_tick - btn3_hold_time > 400) &&
+      } else if ((debounced_buttons & 0x04) && (current_tick - btn3_hold_time > 400) &&
                  (current_tick - last_btn_repeat > 100)) {
         if (motor_target_rpm + MOTOR_RPM_STEP <= MOTOR_RPM_MAX) {
           motor_target_rpm += MOTOR_RPM_STEP;
@@ -467,79 +497,132 @@ int main(void) {
         last_btn_repeat = current_tick;
       }
 
-      // Check buttons (S8 = 0x80, S7 = 0x40, S6 = 0x20, S5 = 0x10, S4 = 0x08)
-      if (buttons != prev_buttons) {
-        if ((buttons & 0x80) && !(prev_buttons & 0x80)) { // S8: Accel & Gyro
-          if (display_mode == 1)
-            sub_mode = (sub_mode + 1) % 6;
-          else {
-            display_mode = 1;
-            sub_mode = 0;
-          }
+      // Button 8 (S8 = 0x80): Accel & Gyro
+      if ((pressed_edges & 0x80) && (current_tick - last_btn_action_tick[7] >= 250)) {
+        last_btn_action_tick[7] = current_tick;
+        if (display_mode == 1)
+          sub_mode = (sub_mode + 1) % 6;
+        else {
+          display_mode = 1;
+          sub_mode = 0;
         }
-        if ((buttons & 0x40) && !(prev_buttons & 0x40)) { // S7: Temperatures
-          if (display_mode == 2)
-            sub_mode = (sub_mode + 1) % (1 + num_ds18b20);
-          else {
-            display_mode = 2;
-            sub_mode = 0;
-          }
-        }
-        if ((buttons & 0x20) && !(prev_buttons & 0x20)) { // S6: Baro
-          display_mode = 3;
-          sub_mode = 0; // Baro only shows altitude/pressure for now
-        }
-        if ((buttons & 0x10) && !(prev_buttons & 0x10)) { // S5: GPS
-          if (display_mode == 4)
-            sub_mode = (sub_mode + 1) % 6; // Lat, Lon, Sats, Fix, PDOP, Alt
-          else {
-            display_mode = 4;
-            sub_mode = 0;
-          }
-        }
-        if ((buttons & 0x08) && !(prev_buttons & 0x08)) { // S4: Logging
-          if (is_logging || sd_error) {
-            f_close(&SDFile);
-            is_logging = 0;
-            sd_error = 0;
-            CLI_Print("Log stopped / Err cleared\r\n");
-          } else {
-            FRESULT mount_res = f_mount(&SDFatFS, SDPath, 1);
-            if (mount_res == FR_OK) {
-              uint16_t file_index = 1;
-              while (file_index < 1000) {
-                sprintf(current_filename, "log%u.bin", file_index);
-                FRESULT open_res =
-                    f_open(&SDFile, current_filename, FA_CREATE_NEW | FA_WRITE);
-                if (open_res == FR_OK) {
-                  is_logging = 1;
-                  sd_error = 0;
-                  log_start_time = HAL_GetTick();
-                  last_log_tick = log_start_time; // Reset log tick
-                  CLI_Print("Log started: %s\r\n", current_filename);
-                  break;
-                }
-                file_index++;
-              }
-              if (file_index >= 1000) {
-                CLI_Print("Log err: index full\r\n");
-                sd_error = 1;
-              }
-            } else {
-              CLI_Print("Log err: mount %d\r\n", mount_res);
-              sd_error = 1;
-            }
-          }
-        }
-        prev_buttons = buttons;
       }
 
-      // Read Sensors
+      // Button 7 (S7 = 0x40): Temperatures and Barometer
+      if ((pressed_edges & 0x40) && (current_tick - last_btn_action_tick[6] >= 250)) {
+        last_btn_action_tick[6] = current_tick;
+        if (display_mode == 2)
+          sub_mode = (sub_mode + 1) % (2 + num_ds18b20);
+        else {
+          display_mode = 2;
+          sub_mode = 0;
+        }
+      }
+
+      // Button 6 (S6 = 0x20): GPS
+      if ((pressed_edges & 0x20) && (current_tick - last_btn_action_tick[5] >= 250)) {
+        last_btn_action_tick[5] = current_tick;
+        if (display_mode == 3)
+          sub_mode = (sub_mode + 1) % 6; // Lat, Lon, Sats, Fix, PDOP, Alt
+        else {
+          display_mode = 3;
+          sub_mode = 0;
+        }
+      }
+
+      // Button 5 (S5 = 0x10): Logging Start / Stop (400ms lockout prevents chatter restart)
+      if ((pressed_edges & 0x10) && (current_tick - last_btn_action_tick[4] >= 400)) {
+        last_btn_action_tick[4] = current_tick;
+        if (is_logging || sd_error) {
+          f_close(&SDFile);
+          is_logging = 0;
+          sd_error = 0;
+          CLI_Print("Log stopped / Err cleared\r\n");
+        } else {
+          FRESULT mount_res = f_mount(&SDFatFS, SDPath, 1);
+          if (mount_res == FR_OK) {
+            uint16_t file_index = 1;
+            while (file_index < 1000) {
+              sprintf(current_filename, "log%u.bin", file_index);
+              FRESULT open_res =
+                  f_open(&SDFile, current_filename, FA_CREATE_NEW | FA_WRITE);
+              if (open_res == FR_OK) {
+                is_logging = 1;
+                sd_error = 0;
+                log_start_time = HAL_GetTick();
+                last_log_tick = log_start_time; // Reset log tick
+
+                // Reset distance and energy baseline at start line
+                accumulated_distance_km = 0.0f;
+                accumulated_energy_ws = 0.0f;
+                accumulated_energy_kwh = 0.0f;
+                km_per_kwh = 0.0f;
+                last_energy_tick = log_start_time;
+
+                CLI_Print("Log started: %s (Baseline Reset)\r\n", current_filename);
+                break;
+              }
+              file_index++;
+            }
+            if (file_index >= 1000) {
+              CLI_Print("Log err: index full\r\n");
+              sd_error = 1;
+            }
+          } else {
+            CLI_Print("Log err: mount %d\r\n", mount_res);
+            sd_error = 1;
+          }
+        }
+      }
+
+      // Button 4 (S4 = 0x08): Motor Telemetry & Efficiency (Vbus, Iq, Watt, RPM1, RPM2, km/kWh)
+      if ((pressed_edges & 0x08) && (current_tick - last_btn_action_tick[3] >= 250)) {
+        last_btn_action_tick[3] = current_tick;
+        if (display_mode == 4)
+          sub_mode = (sub_mode + 1) % 6;
+        else {
+          display_mode = 4;
+          sub_mode = 0;
+        }
+      }
+
+      prev_debounced_buttons = debounced_buttons;
+
+      // 2. Read Sensors
       MPU9250_ReadSensor(&hspi1, &imu_data);
       BMP280_ReadSensor(&hspi1, &bmp_data);
       GPS_GetLatestData(&gps_data); // Gets latest parsed data
 
-      // Display Logic
+      // 3. Distance and Energy Accumulation (since start line / Button 5 logging)
+      if (last_energy_tick == 0) {
+        last_energy_tick = current_tick;
+      }
+      float dt_energy = (current_tick - last_energy_tick) / 1000.0f;
+      last_energy_tick = current_tick;
+
+      if (is_logging && dt_energy > 0.0f && dt_energy < 1.0f) {
+        // Distance: integrated from average wheel speed
+        float avg_wheel_spd = (speed_left_kmh + speed_right_kmh) / 2.0f;
+        if (avg_wheel_spd > 0.0f) {
+          accumulated_distance_km += (avg_wheel_spd / 3600.0f) * dt_energy;
+        }
+
+        // Electrical Energy: Power (Watt) = Vbus * Iq
+        float motor_power = can_vbus * can_actual_iq;
+        if (motor_power > 0.0f) {
+          accumulated_energy_ws += motor_power * dt_energy;
+          accumulated_energy_kwh = accumulated_energy_ws / 3600000.0f;
+        }
+
+        // Efficiency: km / kWh
+        if (accumulated_energy_kwh > 0.00005f) {
+          km_per_kwh = accumulated_distance_km / accumulated_energy_kwh;
+        } else {
+          km_per_kwh = 0.0f;
+        }
+      }
+
+      // 4. Display Logic
       uint8_t led_mask = 0;
 
       Speed_UpdateTimeout();
@@ -580,23 +663,25 @@ int main(void) {
             sprintf(display_str, "gz %5.1f", imu_data.gyro_z);
           break;
 
-        case 2: // Temperatures
+        case 2: // Temperatures dan baro
           led_mask = 1 << sub_mode;
           if (sub_mode == 0)
             sprintf(display_str, "b %6.2f", bmp_data.temperature);
-          else if (sub_mode == 1 && num_ds18b20 > 0)
-            sprintf(display_str, "d1%6.2f", ds18b20_devs[0].temperature);
-          else if (sub_mode == 2 && num_ds18b20 > 1)
-            sprintf(display_str, "d2%6.2f", ds18b20_devs[1].temperature);
+          else if (sub_mode == 1) // Show altitude with 3 decimal places
+            sprintf(display_str, "%8.3f", bmp_data.altitude);
+          else if (sub_mode == 2) {
+            if (num_ds18b20 > 0)
+              sprintf(display_str, "d1%6.2f", ds18b20_devs[0].temperature);
+            else
+              sprintf(display_str, "d1 NONE ");
+          } else if (sub_mode == 3) {
+            if (num_ds18b20 > 1)
+              sprintf(display_str, "d2%6.2f", ds18b20_devs[1].temperature);
+            else
+              sprintf(display_str, "d2 NONE ");
+          }
           break;
-
-        case 3:            // Baro (Altitude)
-          led_mask = 0x10; // LED 5
-          sprintf(display_str, "%8.3f",
-                  bmp_data.altitude); // Show altitude with 3 decimal places
-          break;
-
-        case 4:                     // GPS
+        case 3:                     // GPS
           led_mask = 1 << sub_mode; // LED 1 to 6
           if (gps_data.is_valid || sub_mode >= 2) {
             if (sub_mode == 0)
@@ -613,6 +698,30 @@ int main(void) {
               sprintf(display_str, "ALT%5.1f", gps_data.gps_altitude);
           } else {
             sprintf(display_str, "NO  GPS ");
+          }
+          break;
+
+        case 4: // Motor Telemetry & Efficiency (Button 4)
+          led_mask = 1 << sub_mode; // LED 1 to 6
+          if (sub_mode == 0) {
+            // DC Bus Voltage (V)
+            sprintf(display_str, "U  %5.2f", can_vbus);
+          } else if (sub_mode == 1) {
+            // Actual Iq (A)
+            sprintf(display_str, "A  %5.2f", can_actual_iq);
+          } else if (sub_mode == 2) {
+            // Motor Power (Watt = Vbus * Iq)
+            float power_w = can_vbus * can_actual_iq;
+            sprintf(display_str, "P  %5.1f", power_w);
+          } else if (sub_mode == 3) {
+            // RPM Timer 2 CH1 (Right Wheel)
+            sprintf(display_str, "r1 %5.0f", rpm_tim2ch1);
+          } else if (sub_mode == 4) {
+            // RPM Timer 5 CH2 (Left Wheel)
+            sprintf(display_str, "r2 %5.0f", rpm_tim5ch2);
+          } else if (sub_mode == 5) {
+            // Efficiency (km / kWh)
+            sprintf(display_str, "E  %5.1f", km_per_kwh);
           }
           break;
         }
@@ -634,24 +743,34 @@ int main(void) {
     if (current_tick - last_telemetry_tick >= 500) {
       last_telemetry_tick = current_tick;
 
-      static char tele_buf[256];
+      float temp1 = (num_ds18b20 > 0) ? ds18b20_devs[0].temperature : 0.0f;
+      float temp2 = (num_ds18b20 > 1) ? ds18b20_devs[1].temperature : 0.0f;
+
+      static char tele_buf[512];
       int len = snprintf(
           tele_buf, sizeof(tele_buf),
-          "{\"ts\":%lu,\"y\":%u,\"m\":%u,\"d\":%u,\"h\":%u,\"min\":%u,\"s\":%u,"
+          "{\"ts\":%lu,\"y\":%u,\"m\":%u,\"d\":%u,\"h\":%u,\"min\":%u,\"s\":%"
+          "u,"
           "\"v\":%u,"
           "\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,"
           "\"gx\":%.1f,\"gy\":%.1f,\"gz\":%.1f,"
           "\"alt\":%.1f,"
           "\"lat\":%.6f,\"lon\":%.6f,\"galt\":%.1f,"
           "\"pd\":%.1f,\"fix\":%u,\"ns\":%u,"
-          "\"sl\":%.1f,\"sr\":%.1f}\n",
+          "\"sl\":%.1f,\"sr\":%.1f,"
+          "\"vbus\":%.2f,\"iq\":%.2f,"
+          "\"r1\":%.0f,\"r2\":%.0f,"
+          "\"t1\":%.2f,\"t2\":%.2f}\n",
           current_tick, gps_data.year, gps_data.month, gps_data.day,
           gps_data.hour, gps_data.min, gps_data.sec, gps_data.is_time_valid,
           imu_data.accel_x, imu_data.accel_y, imu_data.accel_z, imu_data.gyro_x,
           imu_data.gyro_y, imu_data.gyro_z, bmp_data.altitude,
           gps_data.latitude, gps_data.longitude, gps_data.gps_altitude,
           gps_data.pdop, gps_data.fix_type, gps_data.num_satellites,
-          speed_left_kmh, speed_right_kmh);
+          speed_left_kmh, speed_right_kmh,
+          can_vbus, can_actual_iq,
+          rpm_tim2ch1, rpm_tim5ch2,
+          temp1, temp2);
 
       if (len > 0 && len < sizeof(tele_buf)) {
         // Use IT (Interrupt) to prevent blocking the main loop
@@ -755,9 +874,9 @@ static void MX_CAN1_Init(void) {
   hcan1.Init.TimeSeg1 = CAN_BS1_11TQ;
   hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan1.Init.TimeTriggeredMode = DISABLE;
-  hcan1.Init.AutoBusOff = ENABLE;
+  hcan1.Init.AutoBusOff = DISABLE;
   hcan1.Init.AutoWakeUp = DISABLE;
-  hcan1.Init.AutoRetransmission = ENABLE;
+  hcan1.Init.AutoRetransmission = DISABLE;
   hcan1.Init.ReceiveFifoLocked = DISABLE;
   hcan1.Init.TransmitFifoPriority = DISABLE;
   if (HAL_CAN_Init(&hcan1) != HAL_OK) {
@@ -1010,7 +1129,7 @@ static void MX_TIM14_Init(void) {
 
   /* USER CODE END TIM14_Init 1 */
   htim14.Instance = TIM14;
-  htim14.Init.Prescaler = (SystemCoreClock / 1000000) - 1;
+  htim14.Init.Prescaler = 0;
   htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim14.Init.Period = 65535;
   htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -1019,7 +1138,15 @@ static void MX_TIM14_Init(void) {
     Error_Handler();
   }
   /* USER CODE BEGIN TIM14_Init 2 */
-
+  htim14.Instance = TIM14;
+  htim14.Init.Prescaler = 83;
+  htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim14.Init.Period = 65535;
+  htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim14) != HAL_OK) {
+    Error_Handler();
+  }
   /* USER CODE END TIM14_Init 2 */
 }
 
@@ -1094,36 +1221,6 @@ static void MX_USART2_UART_Init(void) {
 }
 
 /**
- * @brief USART3 Initialization Function
- * @param None
- * @retval None
- */
-static void MX_USART3_UART_Init(void) {
-
-  /* USER CODE BEGIN USART3_Init 0 */
-
-  /* USER CODE END USART3_Init 0 */
-
-  /* USER CODE BEGIN USART3_Init 1 */
-
-  /* USER CODE END USART3_Init 1 */
-  huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
-  huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
-  huart3.Init.Mode = UART_MODE_TX_RX;
-  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_HalfDuplex_Init(&huart3) != HAL_OK) {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART3_Init 2 */
-
-  /* USER CODE END USART3_Init 2 */
-}
-
-/**
  * @brief USART6 Initialization Function
  * @param None
  * @retval None
@@ -1191,6 +1288,9 @@ static void MX_GPIO_Init(void) {
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, USER_LED_Pin | SPI2_CS_Pin, GPIO_PIN_RESET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(DS18B20_GPIO_Port, DS18B20_Pin, GPIO_PIN_SET);
+
   /*Configure GPIO pin : USER_BTN_Pin */
   GPIO_InitStruct.Pin = USER_BTN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
@@ -1210,6 +1310,13 @@ static void MX_GPIO_Init(void) {
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : DS18B20_Pin */
+  GPIO_InitStruct.Pin = DS18B20_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(DS18B20_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : SDIO_DET_Pin */
   GPIO_InitStruct.Pin = SDIO_DET_Pin;
@@ -1236,7 +1343,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
  */
 void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /* User can add his own implementation to report the HAL error return state
+   */
   __disable_irq();
   while (1) {
   }
@@ -1253,8 +1361,8 @@ void Error_Handler(void) {
 void assert_failed(uint8_t *file, uint32_t line) {
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
-     number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,
-     line) */
+     number, ex: printf("Wrong parameters value: file %s on line %d\r\n",
+     file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

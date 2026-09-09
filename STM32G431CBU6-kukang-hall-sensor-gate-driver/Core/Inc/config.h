@@ -56,7 +56,7 @@ void Config_ParseCommand(char* cmd_line);
 void cdc_printf(const char *format, ...);
 
 // High-speed non-blocking binary telemetry for GUI
-void Telemetry_SendBinary(float pos, float vel, float vq, float target, float ia, float ib, float ic, uint8_t mode);
+void Telemetry_SendBinary(float pos, float vel, float vq, float target, float ia, float ib, float ic, float vbus, uint8_t mode);
 
 // Force PWM and sine table update based on config.pwm_freq
 void Config_ApplyPWMFrequency(void);

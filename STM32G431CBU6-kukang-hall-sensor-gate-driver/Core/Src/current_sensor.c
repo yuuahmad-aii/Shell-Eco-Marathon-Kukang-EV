@@ -29,6 +29,10 @@ static float offset_u_pin = 0.0f;
 static float offset_v_pin = 0.0f;
 static float offset_w_pin = 0.0f;
 
+// DC Bus Voltage (V)
+static volatile float vbus_voltage_filtered = 0.0f;
+#define LPF_ALPHA_VBUS 0.01f
+
 // Helper function to convert ADC raw value to Voltage at the pin
 static inline float ADC_To_Voltage(uint32_t adc_val) {
     return ((float)adc_val / ADC_MAX_VAL) * ADC_VREF;
@@ -81,6 +85,10 @@ float Get_Current_Iq(void) {
     return current_iq_filtered;
 }
 
+float Get_DC_Bus_Voltage(void) {
+    return vbus_voltage_filtered;
+}
+
 // Interrupt callback called when Injected conversion is complete
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc) {
     if (hadc->Instance == ADC1) {
@@ -103,7 +111,18 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc) {
     } 
     else if (hadc->Instance == ADC2) {
         uint32_t raw_w = HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1);
+        uint32_t raw_vbus = HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_2);
+        
         float v_w = ADC_To_Voltage(raw_w);
+        float v_pin_vbus = ADC_To_Voltage(raw_vbus);
+        float v_bus_measured = v_pin_vbus * VBUS_DIVIDER_RATIO;
+        
+        // Low Pass Filter for DC Bus Voltage
+        if (vbus_voltage_filtered == 0.0f) {
+            vbus_voltage_filtered = v_bus_measured;
+        } else {
+            vbus_voltage_filtered = (1.0f - LPF_ALPHA_VBUS) * vbus_voltage_filtered + (LPF_ALPHA_VBUS * v_bus_measured);
+        }
         
         if (!is_calibrated) {
             if (calib_counter_w < CALIBRATION_SAMPLES) {

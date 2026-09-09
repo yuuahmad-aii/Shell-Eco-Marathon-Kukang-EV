@@ -31,11 +31,11 @@ void cdc_printf(const char *format, ...) {
 }
 
 // High-speed non-blocking binary telemetry for GUI
-// Packet structure: [0xAA, 0xBB] [pos:4] [vel:4] [vq:4] [target:4] [ia:4] [ib:4] [ic:4] [mode:1]
-// [CRC:1] [0x55] (33 bytes total)
+// Packet structure: [0xAA, 0xBB] [pos:4] [vel:4] [vq:4] [target:4] [ia:4] [ib:4] [ic:4] [vbus:4] [mode:1]
+// [CRC:1] [0x55] (37 bytes total)
 void Telemetry_SendBinary(float pos, float vel, float vq, float target, float ia, float ib, float ic,
-                          uint8_t mode) {
-  uint8_t tx_buffer[33];
+                          float vbus, uint8_t mode) {
+  uint8_t tx_buffer[37];
 
   tx_buffer[0] = 0xAA;
   tx_buffer[1] = 0xBB;
@@ -48,17 +48,18 @@ void Telemetry_SendBinary(float pos, float vel, float vq, float target, float ia
   memcpy(&tx_buffer[18], &ia, 4);
   memcpy(&tx_buffer[22], &ib, 4);
   memcpy(&tx_buffer[26], &ic, 4);
-  tx_buffer[30] = mode;
+  memcpy(&tx_buffer[30], &vbus, 4);
+  tx_buffer[34] = mode;
 
-  // Calculate simple XOR CRC for the payload
+  // Calculate simple XOR CRC for the payload (bytes 2 to 34)
   uint8_t crc = 0;
-  for (int i = 2; i < 31; i++) {
+  for (int i = 2; i < 35; i++) {
     crc ^= tx_buffer[i];
   }
-  tx_buffer[31] = crc;
-  tx_buffer[32] = 0x55; // Footer
+  tx_buffer[35] = crc;
+  tx_buffer[36] = 0x55; // Footer
 
-  CDC_Transmit_FS(tx_buffer, 33);
+  CDC_Transmit_FS(tx_buffer, 37);
 }
 
 void Config_LoadDefaults(void) {

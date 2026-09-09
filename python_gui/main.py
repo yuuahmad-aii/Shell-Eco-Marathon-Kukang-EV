@@ -15,8 +15,8 @@ from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
 import pyqtgraph as pg
 
 class SerialReaderThread(QThread):
-    # pos, vel, vq, target, ia, ib, ic, mode
-    new_data_signal = pyqtSignal(float, float, float, float, float, float, float, int)
+    # pos, vel, vq, target, ia, ib, ic, vbus, mode
+    new_data_signal = pyqtSignal(float, float, float, float, float, float, float, float, int)
     text_data_signal = pyqtSignal(str)
     
     def __init__(self):
@@ -49,13 +49,13 @@ class SerialReaderThread(QThread):
         sync_state = 0
         payload = bytearray()
         
-        while self.is_running and self.serial_port and self.serial_port.is_open:
+        while self.is_running:
             try:
-                waiting = self.serial_port.in_waiting
+                waiting = self.serial_port.in_waiting if self.serial_port else 0
                 if waiting > 0:
                     data = self.serial_port.read(waiting)
                     for b in data:
-                        # State machine to find 0xAA 0xBB sync and read 21 bytes
+                        # State machine to find 0xAA 0xBB sync and read 37 bytes
                         if sync_state == 0:
                             if b == 0xAA:
                                 sync_state = 1
@@ -78,17 +78,17 @@ class SerialReaderThread(QThread):
                                 sync_state = 0
                         elif sync_state == 2:
                             payload.append(b)
-                            if len(payload) == 33:
-                                if payload[32] == 0x55: # Footer
+                            if len(payload) == 37:
+                                if payload[36] == 0x55: # Footer
                                     # Verify CRC
                                     crc = 0
-                                    for i in range(2, 31):
+                                    for i in range(2, 35):
                                         crc ^= payload[i]
                                         
-                                    if crc == payload[31]:
-                                        # Unpack Little Endian: <fffffffB (7 floats + 1 unsigned byte)
-                                        pos, vel, vq, target, ia, ib, ic, mode = struct.unpack('<fffffffB', payload[2:31])
-                                        self.new_data_signal.emit(pos, vel, vq, target, ia, ib, ic, mode)
+                                    if crc == payload[35]:
+                                        # Unpack Little Endian: <ffffffffB (8 floats + 1 unsigned byte)
+                                        pos, vel, vq, target, ia, ib, ic, vbus, mode = struct.unpack('<ffffffffB', payload[2:35])
+                                        self.new_data_signal.emit(pos, vel, vq, target, ia, ib, ic, vbus, mode)
                                 sync_state = 0
                 else:
                     self.msleep(1)
@@ -359,7 +359,7 @@ class FOCGUI(QMainWindow):
             self.p_vq.setYRange(ymin, ymax, padding=0)
             self.p_phase.setYRange(ymin, ymax, padding=0)
             
-    def on_new_binary_data(self, pos, vel, vq, target, ia, ib, ic, mode):
+    def on_new_binary_data(self, pos, vel, vq, target, ia, ib, ic, vbus, mode):
         import math
         if math.isnan(ia):
             print("NaN detected in ia!")
@@ -375,7 +375,7 @@ class FOCGUI(QMainWindow):
         
         if self.is_logging and self.csv_writer:
             timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            self.csv_writer.writerow([timestamp, pos, vel, target, ia, ib, ic, mode])
+            self.csv_writer.writerow([timestamp, pos, vel, target, ia, ib, ic, vbus, mode])
             
         if len(self.pos_data) > self.max_points:
             diff = len(self.pos_data) - self.max_points

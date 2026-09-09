@@ -386,7 +386,7 @@ void SixStep_Update(float dt) {
 }
 
 extern void cdc_printf(const char *format, ...);
-extern void Telemetry_SendBinary(float pos, float vel, float vq, float target, float ia, float ib, float ic, uint8_t mode);
+extern void Telemetry_SendBinary(float pos, float vel, float vq, float target, float ia, float ib, float ic, float vbus, uint8_t mode);
 
 void SixStep_PrintVerbose(void) {
     float rpm = 0.0f;
@@ -406,16 +406,17 @@ void SixStep_PrintVerbose(void) {
     
     // Send binary to GUI
     // We send: pos=interpolated_angle, vel=rpm, vq=actual_iq, target=target_iq, 
-    // ia=current_u, ib=current_v, ic=current_w, mode=mode
+    // ia=current_u, ib=current_v, ic=current_w, vbus=Get_DC_Bus_Voltage(), mode=mode
     extern float Get_Current_U(void);
     extern float Get_Current_V(void);
     extern float Get_Current_W(void);
     extern float Get_Current_Iq(void);
+    extern float Get_DC_Bus_Voltage(void);
     
     // For now, target_iq is mapped from current_duty until the PI controller is implemented
     float target_iq = current_duty; 
     
-    Telemetry_SendBinary(interpolated_angle, rpm, Get_Current_Iq(), target_iq, Get_Current_U(), Get_Current_V(), Get_Current_W(), mode);
+    Telemetry_SendBinary(interpolated_angle, rpm, Get_Current_Iq(), target_iq, Get_Current_U(), Get_Current_V(), Get_Current_W(), Get_DC_Bus_Voltage(), mode);
 }
 
 void SixStep_PrintDebug(void) {
@@ -439,7 +440,8 @@ void SixStep_PrintDebug(void) {
     extern float Get_Current_U(void);
     extern float Get_Current_V(void);
     extern float Get_Current_W(void);
-    cdc_printf("Current (ACS712): U=%.2f A | V=%.2f A | W=%.2f A\r\n", Get_Current_U(), Get_Current_V(), Get_Current_W());
+    extern float Get_DC_Bus_Voltage(void);
+    cdc_printf("Current (ACS712): U=%.2f A | V=%.2f A | W=%.2f A | Vbus: %.2f V\r\n", Get_Current_U(), Get_Current_V(), Get_Current_W(), Get_DC_Bus_Voltage());
 }
 
 float SixStep_GetElectricalAngle(void) {

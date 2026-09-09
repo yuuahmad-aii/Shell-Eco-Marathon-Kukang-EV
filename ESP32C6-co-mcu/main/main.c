@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "esp_netif_sntp.h"
 
@@ -193,6 +194,19 @@ static void uart_rx_task(void *arg) {
           // Filter out empty lines or garbage
           if (line_len > 10 && line_buffer[0] == '{') {
             ESP_LOGI(TAG, "Received Telemetry: %s", line_buffer);
+
+            // Log extracted multi-sensor telemetry values
+            double vbus = 0, iq = 0, r1 = 0, r2 = 0, t1 = 0, t2 = 0;
+            char *p;
+            if ((p = strstr(line_buffer, "\"vbus\":")) != NULL) vbus = atof(p + 7);
+            if ((p = strstr(line_buffer, "\"iq\":")) != NULL) iq = atof(p + 5);
+            if ((p = strstr(line_buffer, "\"r1\":")) != NULL) r1 = atof(p + 5);
+            if ((p = strstr(line_buffer, "\"r2\":")) != NULL) r2 = atof(p + 5);
+            if ((p = strstr(line_buffer, "\"t1\":")) != NULL) t1 = atof(p + 5);
+            if ((p = strstr(line_buffer, "\"t2\":")) != NULL) t2 = atof(p + 5);
+            ESP_LOGI(TAG, "-> Parsed: Vbus=%.2fV, Iq=%.2fA, RPM1=%.0f, RPM2=%.0f, T1=%.2fC, T2=%.2fC",
+                     vbus, iq, r1, r2, t1, t2);
+
             // Forward to Firebase if WiFi is connected
             EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
             if (bits & WIFI_CONNECTED_BIT) {

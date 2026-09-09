@@ -21,6 +21,12 @@
 // ADC Max Value for 12-bit
 #define ADC_MAX_VAL 4095.0f
 
+// DC Bus Voltage divider resistors (PC4 -> ADC2_IN5)
+// R1 = 100k Ohm connected to Vbus, R2 = 4.7k Ohm connected to GND
+#define VBUS_R1_OHMS 100000.0f
+#define VBUS_R2_OHMS 4700.0f
+#define VBUS_DIVIDER_RATIO ((VBUS_R1_OHMS + VBUS_R2_OHMS) / VBUS_R2_OHMS) // 104.7 / 4.7 = 22.2766f
+
 void CurrentSensor_Init(void);
 
 // Get currents in Amperes
@@ -31,5 +37,8 @@ float Get_Current_W(void);
 // Get FOC Currents (Amperes)
 float Get_Current_Id(void);
 float Get_Current_Iq(void);
+
+// Get DC Bus Voltage (Volts)
+float Get_DC_Bus_Voltage(void);
 
 #endif // CURRENT_SENSOR_H

@@ -8,60 +8,185 @@
       >
         {{ isRecording ? '⏹ Stop & Save Vehicle CSV' : '⏺ Record Vehicle Data' }}
       </button>
-      <label class="file-upload-btn">
+
+      <label class="file-upload-btn" style="cursor: pointer;">
         Upload Log (.bin / .csv)
         <input type="file" accept=".bin,.csv" @change="handleFileUpload" hidden />
       </label>
-      <label class="file-upload-btn" style="background-color: var(--secondary); color: #fff;">
+
+      <button 
+        v-if="isOfflineMode"
+        class="file-upload-btn" 
+        @click="exitOfflineMode"
+        style="background-color: #3b82f6; color: #fff;"
+      >
+        🔄 Live Stream Mode
+      </button>
+
+      <label class="file-upload-btn" style="background-color: var(--secondary); color: #fff; cursor: pointer;">
         Convert .bin to .csv
         <input type="file" accept=".bin" @change="convertBinToCsv" hidden />
       </label>
-      <div class="status" :class="isConnected ? 'status-connected' : 'status-disconnected'">
+
+      <div class="status" :class="isConnected ? 'status-connected' : (isOfflineMode ? 'status-offline' : 'status-disconnected')">
         {{ isConnected ? 'Live Connection' : (isOfflineMode ? 'Offline Log Mode' : 'Connecting...') }}
       </div>
     </Teleport>
 
     <!-- VEHICLE TELEMETRY -->
-    <main class="dashboard-grid">
+    <main class="dashboard-grid" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);">
 
-      <!-- Left Column: Map -->
+      <!-- Left Column: Map & Serial Terminal (50% Width) -->
       <div class="map-column">
+        <!-- GPS Map Card -->
         <div class="chart-card map-card">
           <div class="chart-title">GPS Track Map (Terrain)</div>
-          <div id="leaflet-map" style="flex: 1; min-height: 400px; border-radius: 8px;"></div>
+          <div id="leaflet-map" style="flex: 1; min-height: 380px; border-radius: 8px;"></div>
+        </div>
+
+        <!-- Telemetry Board Serial Terminal -->
+        <div class="chart-card terminal-card" style="display: flex; flex-direction: column; min-height: 340px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <div class="chart-title" style="margin-bottom: 0;">📟 Telemetry Serial Terminal</div>
+            <button 
+              class="file-upload-btn" 
+              style="padding: 5px 12px; font-size: 12px;"
+              :style="{ backgroundColor: isSerialConnected ? 'var(--warning)' : 'var(--accent-primary)', color: isSerialConnected ? '#000' : '#fff' }"
+              @click="toggleSerialConnection"
+            >
+              {{ isSerialConnected ? 'Disconnect USB' : 'Connect USB Telemetry' }}
+            </button>
+          </div>
+
+          <!-- Quick CLI Command Buttons -->
+          <div style="display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap;">
+            <button class="quick-cli-btn" @click="sendQuickCli('$$')" title="Show Configs ($10-$30)">$$ (Config)</button>
+            <button class="quick-cli-btn" @click="sendQuickCli('$?')" title="Show Live Sensor Status">$? (Status)</button>
+            <button class="quick-cli-btn" @click="sendQuickCli('$i')" title="Show Firmware & Sensor Info">$i (Info)</button>
+            <button class="quick-cli-btn" @click="sendQuickCli('$sd')" title="Show MicroSD Card Status">$sd (MicroSD)</button>
+            <button class="quick-cli-btn" @click="sendQuickCli('$cal')" title="Calibrate Sensors">$cal (Calibrate)</button>
+          </div>
+
+          <!-- Terminal Output -->
+          <textarea 
+            readonly 
+            ref="terminalOutput" 
+            :value="terminalText" 
+            class="terminal-output" 
+            style="flex: 1; width: 100%; min-height: 180px; background: #0f172a; color: #10b981; font-family: 'Fira Code', monospace; font-size: 12px; padding: 10px; border-radius: 6px; border: 1px solid var(--border); resize: vertical; margin-bottom: 8px;"
+          ></textarea>
+
+          <!-- Input row -->
+          <div style="display: flex; gap: 8px;">
+            <input 
+              type="text" 
+              v-model="cmdInput" 
+              @keyup.enter="sendSerialCommand" 
+              style="flex: 1; padding: 6px 12px; background: #0f172a; color: #fff; border: 1px solid var(--border); border-radius: 4px; font-family: monospace; font-size: 13px;" 
+              placeholder="Ketik perintah (misal: $$, $?, $10=500, $w)..."
+            />
+            <button class="file-upload-btn" style="padding: 6px 14px; font-size: 13px;" @click="sendSerialCommand">Send</button>
+            <button class="file-upload-btn" style="background: var(--border); color: #fff; padding: 6px 10px; font-size: 13px;" @click="terminalText = ''">Clear</button>
+          </div>
         </div>
       </div>
 
-      <!-- Right Column: Charts -->
+      <!-- Right Column: Charts (50% Width) -->
       <div class="charts-column">
-        <!-- Accel -->
-        <div class="chart-card">
-          <div class="chart-title">Acceleration (G)</div>
-          <apexchart type="line" height="200" :options="accelOptions" :series="accelSeries"></apexchart>
+        <!-- 1. Motor Electrical (DC Bus Voltage & Actual Iq Current) -->
+        <div class="chart-card chart-with-axis">
+          <div style="flex: 1; min-width: 0;">
+            <div class="chart-title">Motor Electrical (Voltage & Current)</div>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="220" :options="elecOptions" :series="elecSeries"></apexchart>
+          </div>
+          <div class="axis-panel">
+            <label>Y Max <input type="number" v-model.lazy="elecYMax" class="axis-input"></label>
+            <label>Y Min <input type="number" v-model.lazy="elecYMin" class="axis-input"></label>
+          </div>
         </div>
 
-        <!-- Gyro -->
-        <div class="chart-card">
-          <div class="chart-title">Angular Velocity (Gyro)</div>
-          <apexchart type="line" height="200" :options="gyroOptions" :series="gyroSeries"></apexchart>
+        <!-- 2. Wheel RPM (Timer 2 CH1 vs Timer 5 CH2) -->
+        <div class="chart-card chart-with-axis">
+          <div style="flex: 1; min-width: 0;">
+            <div class="chart-title">Wheel RPM (TIM2 Right vs TIM5 Left)</div>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="220" :options="rpmOptions" :series="rpmSeries"></apexchart>
+          </div>
+          <div class="axis-panel">
+            <label>Y Max <input type="number" v-model.lazy="rpmYMax" class="axis-input"></label>
+            <label>Y Min <input type="number" v-model.lazy="rpmYMin" class="axis-input"></label>
+          </div>
         </div>
 
-        <!-- Speed -->
-        <div class="chart-card">
-          <div class="chart-title">Vehicle Speed (km/h)</div>
-          <apexchart type="line" height="200" :options="speedOptions" :series="speedSeries"></apexchart>
+        <!-- 3. Temperature Sensors (DS18B20 Suhu 1 & Suhu 2) -->
+        <div class="chart-card chart-with-axis">
+          <div style="flex: 1; min-width: 0;">
+            <div class="chart-title">Temperature Sensors (Suhu 1 & Suhu 2)</div>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="220" :options="tempOptions" :series="tempSeries"></apexchart>
+          </div>
+          <div class="axis-panel">
+            <label>Y Max <input type="number" v-model.lazy="tempYMax" class="axis-input"></label>
+            <label>Y Min <input type="number" v-model.lazy="tempYMin" class="axis-input"></label>
+          </div>
         </div>
 
-        <!-- Altitude -->
-        <div class="chart-card">
-          <div class="chart-title">Altitude (Baro vs GPS)</div>
-          <apexchart type="line" height="200" :options="altOptions" :series="altSeries"></apexchart>
+        <!-- 4. Acceleration -->
+        <div class="chart-card chart-with-axis">
+          <div style="flex: 1; min-width: 0;">
+            <div class="chart-title">Acceleration (G)</div>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="200" :options="accelOptions" :series="accelSeries"></apexchart>
+          </div>
+          <div class="axis-panel">
+            <label>Y Max <input type="number" v-model.lazy="accelYMax" class="axis-input"></label>
+            <label>Y Min <input type="number" v-model.lazy="accelYMin" class="axis-input"></label>
+          </div>
         </div>
 
-        <!-- GPS Quality -->
-        <div class="chart-card">
-          <div class="chart-title">GPS Quality (Satellites & PDOP)</div>
-          <apexchart type="line" height="200" :options="gpsOptions" :series="gpsSeries"></apexchart>
+        <!-- 5. Angular Velocity (Gyro) -->
+        <div class="chart-card chart-with-axis">
+          <div style="flex: 1; min-width: 0;">
+            <div class="chart-title">Angular Velocity (Gyro)</div>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="200" :options="gyroOptions" :series="gyroSeries"></apexchart>
+          </div>
+          <div class="axis-panel">
+            <label>Y Max <input type="number" v-model.lazy="gyroYMax" class="axis-input"></label>
+            <label>Y Min <input type="number" v-model.lazy="gyroYMin" class="axis-input"></label>
+          </div>
+        </div>
+
+        <!-- 6. Vehicle Speed -->
+        <div class="chart-card chart-with-axis">
+          <div style="flex: 1; min-width: 0;">
+            <div class="chart-title">Vehicle Speed (km/h)</div>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="200" :options="speedOptions" :series="speedSeries"></apexchart>
+          </div>
+          <div class="axis-panel">
+            <label>Y Max <input type="number" v-model.lazy="speedYMax" class="axis-input"></label>
+            <label>Y Min <input type="number" v-model.lazy="speedYMin" class="axis-input"></label>
+          </div>
+        </div>
+
+        <!-- 7. Altitude -->
+        <div class="chart-card chart-with-axis">
+          <div style="flex: 1; min-width: 0;">
+            <div class="chart-title">Altitude (Baro vs GPS)</div>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="200" :options="altOptions" :series="altSeries"></apexchart>
+          </div>
+          <div class="axis-panel">
+            <label>Y Max <input type="number" v-model.lazy="altYMax" class="axis-input"></label>
+            <label>Y Min <input type="number" v-model.lazy="altYMin" class="axis-input"></label>
+          </div>
+        </div>
+
+        <!-- 8. GPS Quality -->
+        <div class="chart-card chart-with-axis">
+          <div style="flex: 1; min-width: 0;">
+            <div class="chart-title">GPS Quality (Satellites & PDOP)</div>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="200" :options="gpsOptions" :series="gpsSeries"></apexchart>
+          </div>
+          <div class="axis-panel">
+            <label>Y Max <input type="number" v-model.lazy="gpsYMax" class="axis-input"></label>
+            <label>Y Min <input type="number" v-model.lazy="gpsYMin" class="axis-input"></label>
+          </div>
         </div>
       </div>
     </main>
@@ -85,8 +210,19 @@ onMounted(() => { isMounted.value = true })
 const isRecording = ref(false)
 const isConnected = ref(false)
 const isOfflineMode = ref(false)
+const offlineSessionKey = ref(0)
 const recordedData = ref([])
 let connectionTimeout = null
+
+// --- WEB SERIAL TERMINAL STATE ---
+const isSerialConnected = ref(false)
+const terminalText = ref("--- Telemetry USB Serial Terminal ---\nHubungkan kabel USB STM32F446RE ke laptop lalu klik 'Connect USB Telemetry'.\nPerintah CLI tersedia:\n  $$      : Tampilkan parameter konfigurasi ($10-$30)\n  $?      : Tampilkan status sensor real-time\n  $i      : Tampilkan info firmware & chip ID sensor\n  $sd     : Tampilkan status microSD\n  $10=val : Ubah konfigurasi (misal $10=500)\n  $w      : Simpan konfigurasi ke memori\n\n")
+const cmdInput = ref('')
+const terminalOutput = ref(null)
+let serialPort = null
+let serialReader = null
+let serialWriter = null
+let keepSerialReading = false
 
 // --- VARIABEL PETA (LEAFLET) ---
 let mapInstance = null
@@ -104,6 +240,32 @@ const speedHistory = shallowRef([])
 const pdopHistory = shallowRef([]); const satsHistory = shallowRef([])
 const liveLats = shallowRef([]); const liveLons = shallowRef([])
 
+// Variabel data telemetri baru
+const vbusHistory = shallowRef([])
+const iqHistory = shallowRef([])
+const r1History = shallowRef([])
+const r2History = shallowRef([])
+const t1History = shallowRef([])
+const t2History = shallowRef([])
+
+// --- AXIS BOUNDS REFS ---
+const elecYMax = ref(60)
+const elecYMin = ref(-10)
+const rpmYMax = ref(1000)
+const rpmYMin = ref(0)
+const tempYMax = ref(80)
+const tempYMin = ref(0)
+const accelYMax = ref(2)
+const accelYMin = ref(-2)
+const gyroYMax = ref(100)
+const gyroYMin = ref(-100)
+const speedYMax = ref(50)
+const speedYMin = ref(0)
+const altYMax = ref(100)
+const altYMin = ref(0)
+const gpsYMax = ref(20)
+const gpsYMin = ref(0)
+
 // --- FUNGSI HELPER & FORMATTER ---
 const clearData = () => {
   timeHistory.value = []
@@ -112,15 +274,27 @@ const clearData = () => {
   baroAlt.value = []; gpsAlt.value = []; speedHistory.value = []
   pdopHistory.value = []; satsHistory.value = []
   liveLats.value = []; liveLons.value = []
+
+  vbusHistory.value = []
+  iqHistory.value = []
+  r1History.value = []
+  r2History.value = []
+  t1History.value = []
+  t2History.value = []
   
   if (polyline) polyline.setLatLngs([])
-  if (startMarker) mapInstance.removeLayer(startMarker)
-  if (endMarker) mapInstance.removeLayer(endMarker)
-  if (hoverMarker) mapInstance.removeLayer(hoverMarker)
+  if (startMarker && mapInstance) mapInstance.removeLayer(startMarker)
+  if (endMarker && mapInstance) mapInstance.removeLayer(endMarker)
+  if (hoverMarker && mapInstance) mapInstance.removeLayer(hoverMarker)
+}
+
+const exitOfflineMode = () => {
+  isOfflineMode.value = false
+  clearData()
 }
 
 const formatX = (val) => {
-  if (val === undefined || val === null || isNaN(val)) return val;
+  if (val === undefined || val === null || isNaN(val)) return '';
   if (val < 60) return Number(val).toFixed(1) + 's';
   if (val < 3600) return (Number(val) / 60).toFixed(1) + 'm';
   return (Number(val) / 3600).toFixed(2) + 'h';
@@ -138,7 +312,7 @@ const getDistanceFromLatLonInKm = (lat1, lon1, lat2, lon2) => {
 }
 
 const updateHoverMarker = (idx) => {
-  if (idx < 0 || idx >= liveLats.value.length) return
+  if (idx < 0 || idx >= liveLats.value.length || !mapInstance) return
   const lat = liveLats.value[idx]
   const lon = liveLons.value[idx]
   
@@ -158,17 +332,124 @@ const updateHoverMarker = (idx) => {
   }
 }
 
+// --- TERMINAL SERIAL METHODS ---
+const appendToTerminal = (text) => {
+  terminalText.value += text
+  if (terminalText.value.length > 8000) {
+    terminalText.value = terminalText.value.slice(-8000)
+  }
+  nextTick(() => {
+    if (terminalOutput.value) {
+      terminalOutput.value.scrollTop = terminalOutput.value.scrollHeight
+    }
+  })
+}
+
+const toggleSerialConnection = async () => {
+  if (isSerialConnected.value) {
+    keepSerialReading = false
+    try {
+      if (serialReader) {
+        await serialReader.cancel()
+        serialReader.releaseLock()
+        serialReader = null
+      }
+      if (serialWriter) {
+        serialWriter.releaseLock()
+        serialWriter = null
+      }
+      if (serialPort) {
+        await serialPort.close()
+        serialPort = null
+      }
+    } catch (e) {
+      console.error(e)
+    }
+    isSerialConnected.value = false
+    appendToTerminal("\n[Serial Disconnected]\n")
+  } else {
+    if (!("serial" in navigator)) {
+      alert("Web Serial API tidak didukung pada browser ini. Gunakan Google Chrome, Microsoft Edge, atau Opera.")
+      return
+    }
+    try {
+      serialPort = await navigator.serial.requestPort()
+      await serialPort.open({ baudRate: 115200 })
+      isSerialConnected.value = true
+      keepSerialReading = true
+      appendToTerminal("\n[Connected to Telemetry Board @ 115200 baud]\n")
+
+      const textDecoder = new TextDecoderStream()
+      serialPort.readable.pipeTo(textDecoder.writable)
+      serialReader = textDecoder.readable.getReader()
+
+      const textEncoder = new TextEncoderStream()
+      textEncoder.readable.pipeTo(serialPort.writable)
+      serialWriter = textEncoder.writable.getWriter()
+
+      readSerialLoop()
+    } catch (err) {
+      console.error(err)
+      isSerialConnected.value = false
+      appendToTerminal(`\n[Koneksi Gagal: ${err.message}]\n`)
+    }
+  }
+}
+
+const readSerialLoop = async () => {
+  try {
+    while (keepSerialReading && serialReader) {
+      const { value, done } = await serialReader.read()
+      if (done) break
+      if (value) {
+        appendToTerminal(value)
+      }
+    }
+  } catch (err) {
+    if (keepSerialReading) {
+      console.error("Serial read error:", err)
+      appendToTerminal(`\n[Read Error: ${err.message}]\n`)
+    }
+  }
+}
+
+const sendSerialCommand = async () => {
+  if (!serialWriter || !cmdInput.value.trim()) return
+  try {
+    const cmd = cmdInput.value.trim()
+    appendToTerminal("> " + cmd + "\n")
+    await serialWriter.write(cmd + "\r\n")
+    cmdInput.value = ""
+  } catch (err) {
+    console.error(err)
+  }
+}
+
+const sendQuickCli = async (cmd) => {
+  if (!serialWriter) {
+    cmdInput.value = cmd
+    return
+  }
+  try {
+    appendToTerminal("> " + cmd + "\n")
+    await serialWriter.write(cmd + "\r\n")
+  } catch (err) {
+    console.error(err)
+  }
+}
+
+// --- RECORDING & LOGGING ---
 const toggleRecording = () => {
   if (isRecording.value) {
     if (recordedData.value.length === 0) {
-      alert("No data recorded yet!")
+      alert("Belum ada data yang terekam!")
       isRecording.value = false
       return
     }
     
-    let csv = "Time,Ax,Ay,Az,Gx,Gy,Gz,BaroAlt,Lat,Lon,GPSAlt,PDOP,Satellites\n"
+    let csv = "Time,Ax,Ay,Az,Gx,Gy,Gz,BaroAlt,Lat,Lon,GPSAlt,PDOP,Satellites,Vbus,Iq,RPM_TIM2CH1,RPM_TIM5CH2,Temp1,Temp2\n"
     recordedData.value.forEach(r => {
-      csv += `${r.time},${r.ax},${r.ay},${r.az},${r.gx},${r.gy},${r.gz},${r.alt},${r.lat},${r.lon},${r.galt},${r.pd},${r.ns}\n`
+      csv += `${r.time},${r.ax},${r.ay},${r.az},${r.gx},${r.gy},${r.gz},${r.alt},${r.lat},${r.lon},${r.galt},${r.pd},${r.ns},${r.vbus ?? 0},${r.iq ?? 0},${r.r1 ?? 0},${r.r2 ?? 0},${r.t1 ?? 0},${r.t2 ?? 0}\n`
     })
     
     const blob = new Blob([csv], { type: 'text/csv' })
@@ -187,81 +468,135 @@ const toggleRecording = () => {
   }
 }
 
-// --- KONFIGURASI GRAFIK ---
-const sharedGrid = { borderColor: 'rgba(255,255,255,0.05)' }
-const buildOptions = (group, yAxisConfig) => {
-  const formattedYAxis = Array.isArray(yAxisConfig) 
-    ? yAxisConfig.map(y => ({ ...y, decimalsInFloat: 2 }))
-    : { ...yAxisConfig, decimalsInFloat: 2 };
+// --- BUILD APEXCHARTS OPTIONS DENGAN TOOLBAR KONDISIONAL & AXIS MIN/MAX ---
+const sharedGrid = { borderColor: 'rgba(255,255,255,0.08)', strokeDashArray: 3 }
 
-  return {
-    chart: { 
-      id: group + '-chart', group: 'sync-telemetry', type: 'line', 
-      animations: { enabled: false },
-      toolbar: { show: true }, background: 'transparent',
-      foreColor: '#e2e8f0',
-      events: {
-        mouseMove: (event, chartContext, config) => {
-          if (config.dataPointIndex !== -1) updateHoverMarker(config.dataPointIndex)
+const buildVehicleOptions = (group, titleText, yMinRef, yMaxRef) => {
+  return computed(() => {
+    const safeYMin = isNaN(parseFloat(yMinRef?.value)) ? undefined : parseFloat(yMinRef.value)
+    const safeYMax = isNaN(parseFloat(yMaxRef?.value)) ? undefined : parseFloat(yMaxRef.value)
+
+    return {
+      chart: { 
+        id: group + '-chart', 
+        group: isOfflineMode.value ? 'sync-telemetry' : undefined, 
+        type: 'line', 
+        animations: { enabled: false },
+        toolbar: { 
+          show: isOfflineMode.value,
+          tools: {
+            download: true,
+            selection: true,
+            zoom: true,
+            zoomin: true,
+            zoomout: true,
+            pan: true,
+            reset: true
+          },
+          autoSelected: 'zoom'
         },
-        mouseLeave: () => {
-          if (hoverMarker) { mapInstance.removeLayer(hoverMarker); hoverMarker = null }
+        zoom: {
+          enabled: isOfflineMode.value,
+          type: 'x',
+          autoScaleYaxis: false
+        },
+        pan: {
+          enabled: isOfflineMode.value
+        },
+        background: 'transparent',
+        foreColor: '#e2e8f0',
+        events: {
+          mouseMove: (event, chartContext, config) => {
+            if (config && config.dataPointIndex !== -1) updateHoverMarker(config.dataPointIndex)
+          },
+          mouseLeave: () => {
+            if (hoverMarker && mapInstance) { mapInstance.removeLayer(hoverMarker); hoverMarker = null }
+          }
         }
+      },
+      stroke: { width: 2, curve: 'straight' },
+      xaxis: { 
+        type: 'numeric',
+        tickAmount: 8,
+        labels: { show: true, formatter: formatX }, 
+        axisBorder: { show: true } 
+      },
+      yaxis: {
+        title: { text: titleText },
+        min: safeYMin,
+        max: safeYMax,
+        decimalsInFloat: 2,
+        tickAmount: 4
+      },
+      grid: sharedGrid,
+      legend: { position: 'top', horizontalAlign: 'left', offsetX: 10 },
+      tooltip: { 
+        theme: 'dark', 
+        x: { show: true, formatter: formatX },
+        y: { formatter: (val) => (val !== undefined && val !== null && !isNaN(val)) ? Number(val).toFixed(2) : '' } 
       }
-    },
-    stroke: { width: 2, curve: 'straight' },
-    xaxis: { 
-      type: 'numeric',
-      tickAmount: 10,
-      labels: { show: true, formatter: formatX }, 
-      axisBorder: { show: true } 
-    },
-    yaxis: formattedYAxis,
-    grid: sharedGrid,
-    legend: { position: 'top', horizontalAlign: 'left', offsetX: 10 },
-    tooltip: { 
-      theme: 'dark', 
-      x: { show: true, formatter: formatX },
-      y: { formatter: (val) => val } 
     }
-  }
+  })
 }
 
-const accelOptions = buildOptions('accel', { title: { text: 'G' }, tickAmount: 4 })
+// 1. Motor Electrical (DC Bus Voltage & Actual Iq)
+const elecOptions = buildVehicleOptions('elec', 'V / A', elecYMin, elecYMax)
+const elecSeries = computed(() => [
+  { name: 'DC Bus Voltage (V)', data: vbusHistory.value, color: '#10B981' },
+  { name: 'Actual Iq (A)', data: iqHistory.value, color: '#F59E0B' }
+])
+
+// 2. Wheel RPM (TIM2 CH1 & TIM5 CH2)
+const rpmOptions = buildVehicleOptions('rpm', 'RPM', rpmYMin, rpmYMax)
+const rpmSeries = computed(() => [
+  { name: 'TIM2 CH1 (Right Wheel)', data: r1History.value, color: '#3B82F6' },
+  { name: 'TIM5 CH2 (Left Wheel)', data: r2History.value, color: '#A855F7' }
+])
+
+// 3. Temperature Sensors (Suhu 1 & Suhu 2)
+const tempOptions = buildVehicleOptions('temp', '°C', tempYMin, tempYMax)
+const tempSeries = computed(() => [
+  { name: 'Suhu 1 (°C)', data: t1History.value, color: '#F43F5E' },
+  { name: 'Suhu 2 (°C)', data: t2History.value, color: '#06B6D4' }
+])
+
+// 4. Accel
+const accelOptions = buildVehicleOptions('accel', 'G', accelYMin, accelYMax)
 const accelSeries = computed(() => [
   { name: 'Accel X', data: accelX.value, color: '#EF4444' }, 
   { name: 'Accel Y', data: accelY.value, color: '#10B981' }, 
   { name: 'Accel Z', data: accelZ.value, color: '#3B82F6' }  
 ])
 
-const gyroOptions = buildOptions('gyro', { title: { text: 'deg/s' }, tickAmount: 4 })
+// 5. Gyro
+const gyroOptions = buildVehicleOptions('gyro', 'deg/s', gyroYMin, gyroYMax)
 const gyroSeries = computed(() => [
   { name: 'Gyro X', data: gyroX.value, color: '#F59E0B' }, 
   { name: 'Gyro Y', data: gyroY.value, color: '#8B5CF6' }, 
   { name: 'Gyro Z', data: gyroZ.value, color: '#06B6D4' }  
 ])
 
-const altOptions = buildOptions('alt', { title: { text: 'Meters' }, tickAmount: 4 })
+// 6. Speed
+const speedOptions = buildVehicleOptions('speed', 'km/h', speedYMin, speedYMax)
+const speedSeries = computed(() => [
+  { name: 'Speed (km/h)', data: speedHistory.value, color: '#10B981' }
+])
+
+// 7. Altitude
+const altOptions = buildVehicleOptions('alt', 'Meters', altYMin, altYMax)
 const altSeries = computed(() => [
   { name: 'Baro Altitude', data: baroAlt.value, color: '#FCD34D' }, 
   { name: 'GPS Altitude', data: gpsAlt.value, color: '#2DD4BF' }    
 ])
 
-const speedOptions = buildOptions('speed', { title: { text: 'km/h' }, tickAmount: 4, min: 0 })
-const speedSeries = computed(() => [
-  { name: 'Speed', data: speedHistory.value, color: '#F43F5E' } 
-])
-
-const gpsOptions = buildOptions('gps', [
-  { seriesName: 'Satellites', title: { text: 'Satellites' }, min: 0, tickAmount: 4 },
-  { opposite: true, seriesName: 'PDOP', title: { text: 'PDOP' }, min: 0, tickAmount: 4 }
-])
+// 8. GPS Quality
+const gpsOptions = buildVehicleOptions('gps', 'Value', gpsYMin, gpsYMax)
 const gpsSeries = computed(() => [
-  { name: 'Satellites', data: satsHistory.value, color: '#F472B6' },
-  { name: 'PDOP', data: pdopHistory.value, color: '#E2E8F0' }
+  { name: 'Satellites', data: satsHistory.value, color: '#10B981' },
+  { name: 'PDOP', data: pdopHistory.value, color: '#F59E0B' }
 ])
 
-// File Upload Handler (Offline Data)
+// --- FILE UPLOAD & LOG PARSER ---
 const convertBinToCsv = async (event) => {
   const file = event.target.files[0]
   if (!file) return
@@ -319,11 +654,12 @@ const handleFileUpload = async (event) => {
 
   isOfflineMode.value = true
   isConnected.value = false
+  offlineSessionKey.value++
   clearData()
 
-  // Temporary arrays for bulk push
   const tempTime = [], tempAx = [], tempAy = [], tempAz = [], tempGx = [], tempGy = [], tempGz = []
   const tempBAlt = [], tempGAlt = [], tempSpeed = [], tempPdop = [], tempSats = [], tempLat = [], tempLon = []
+  const tempVbus = [], tempIq = [], tempR1 = [], tempR2 = [], tempT1 = [], tempT2 = []
   
   let prevT = null; let prevLat = null; let prevLon = null;
 
@@ -333,7 +669,6 @@ const handleFileUpload = async (event) => {
     let offset = 0
     const structLen = 58
     
-    // Downsample large files to prevent browser crashes (max ~400 points)
     const totalStructs = Math.floor(buffer.byteLength / structLen)
     const step = Math.max(1, Math.floor(totalStructs / 400))
     
@@ -350,7 +685,8 @@ const handleFileUpload = async (event) => {
       
       const lat = view.getFloat32(offset + 40, true)
       const lon = view.getFloat32(offset + 44, true)
-      tempLat.push(lat); tempLon.push(lon) // Push all points to maintain 1:1 index mapping
+      tempLat.push(lat)
+      tempLon.push(lon)
       
       let speed = 0;
       if (prevLat && prevLon && prevT && lat !== 0 && lon !== 0) {
@@ -368,85 +704,104 @@ const handleFileUpload = async (event) => {
     }
   } else if (file.name.endsWith('.csv')) {
     const text = await file.text()
-    const lines = text.split('\n')
+    const lines = text.split(/\r?\n/)
     if (lines.length < 2) return
     
-    // Check header to determine format
-    const header = lines[0].trim()
-    const isNewFormat = header.startsWith("Time,Ax")
+    const headerCols = lines[0].trim().toLowerCase().split(',').map(c => c.trim())
     
-    // Downsample large files to prevent browser crashes (max ~400 points)
+    let idxTime = headerCols.findIndex(c => c.includes('time'))
+    let idxAx = headerCols.findIndex(c => c.includes('ax') || c.includes('accel_x'))
+    let idxAy = headerCols.findIndex(c => c.includes('ay') || c.includes('accel_y'))
+    let idxAz = headerCols.findIndex(c => c.includes('az') || c.includes('accel_z'))
+    let idxGx = headerCols.findIndex(c => c.includes('gx') || c.includes('gyro_x'))
+    let idxGy = headerCols.findIndex(c => c.includes('gy') || c.includes('gyro_y'))
+    let idxGz = headerCols.findIndex(c => c.includes('gz') || c.includes('gyro_z'))
+    let idxAlt = headerCols.findIndex(c => c.includes('baro') || c.includes('alt') && !c.includes('gps'))
+    let idxLat = headerCols.findIndex(c => c.includes('lat'))
+    let idxLon = headerCols.findIndex(c => c.includes('lon'))
+    let idxGAlt = headerCols.findIndex(c => c.includes('gpsalt') || c.includes('gps_altitude'))
+    let idxPdop = headerCols.findIndex(c => c.includes('pdop') || c.includes('pd'))
+    let idxSats = headerCols.findIndex(c => c.includes('sat'))
+
+    let idxVbus = headerCols.findIndex(c => c.includes('vbus') || c.includes('volt'))
+    let idxIq = headerCols.findIndex(c => c.includes('iq') || c.includes('current'))
+    let idxR1 = headerCols.findIndex(c => c.includes('tim2') || c.includes('rpm1') || c.includes('r1'))
+    let idxR2 = headerCols.findIndex(c => c.includes('tim5') || c.includes('rpm2') || c.includes('r2'))
+    let idxT1 = headerCols.findIndex(c => c.includes('temp1') || c.includes('t1') || c.includes('suhu1'))
+    let idxT2 = headerCols.findIndex(c => c.includes('temp2') || c.includes('t2') || c.includes('suhu2'))
+
     const step = Math.max(1, Math.floor(lines.length / 400))
     
     for (let i = 1; i < lines.length; i += step) {
       if (!lines[i].trim()) continue
       const cols = lines[i].split(',')
       
-      if (isNewFormat) {
-        if (cols.length < 13) continue
-        
-        // Time is already in ms (Date.now()) or timestamp
-        const t = parseFloat((parseFloat(cols[0]) / 1000).toFixed(1))
-        tempTime.push(t)
-        tempAx.push([t, parseFloat(cols[1])]); tempAy.push([t, parseFloat(cols[2])]); tempAz.push([t, parseFloat(cols[3])])
-        tempGx.push([t, parseFloat(cols[4])]); tempGy.push([t, parseFloat(cols[5])]); tempGz.push([t, parseFloat(cols[6])])
-        tempBAlt.push([t, parseFloat(cols[7])])
-        
-        const lat = parseFloat(cols[8]); const lon = parseFloat(cols[9])
-        tempLat.push(lat); tempLon.push(lon) // Push all points to maintain 1:1 index mapping
-        
-        let speed = 0;
-        if (prevLat && prevLon && prevT && lat !== 0 && lon !== 0) {
-          const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, lat, lon);
-          if (t - prevT > 0) speed = (distKm / (t - prevT)) * 3600;
-        }
-        if (lat !== 0 && lon !== 0) { prevLat = lat; prevLon = lon; prevT = t; }
-        tempSpeed.push([t, speed])
-        
-        tempGAlt.push([t, parseFloat(cols[10])]); tempPdop.push([t, parseFloat(cols[11])]); tempSats.push([t, parseFloat(cols[12])])
-      } else {
-        if (cols.length < 21) continue
-        
-        const t = parseFloat((parseFloat(cols[0]) / 1000).toFixed(1))
-        tempTime.push(t)
-        tempAx.push([t, parseFloat(cols[8])]); tempAy.push([t, parseFloat(cols[9])]); tempAz.push([t, parseFloat(cols[10])])
-        tempGx.push([t, parseFloat(cols[11])]); tempGy.push([t, parseFloat(cols[12])]); tempGz.push([t, parseFloat(cols[13])])
-        tempBAlt.push([t, parseFloat(cols[14])])
-        
-        const lat = parseFloat(cols[15]); const lon = parseFloat(cols[16])
-        tempLat.push(lat); tempLon.push(lon) // Push all points to maintain 1:1 index mapping
-        
-        let speed = 0;
-        if (prevLat && prevLon && prevT && lat !== 0 && lon !== 0) {
-          const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, lat, lon);
-          if (t - prevT > 0) speed = (distKm / (t - prevT)) * 3600;
-        }
-        if (lat !== 0 && lon !== 0) { prevLat = lat; prevLon = lon; prevT = t; }
-        tempSpeed.push([t, speed])
-        
-        tempGAlt.push([t, parseFloat(cols[17])]); tempPdop.push([t, parseFloat(cols[18])]); tempSats.push([t, parseFloat(cols[20])])
+      const rawTime = parseFloat(cols[idxTime >= 0 ? idxTime : 0])
+      const t = parseFloat((rawTime > 10000000 ? (rawTime / 1000) : rawTime).toFixed(1))
+      tempTime.push(t)
+      
+      if (idxAx >= 0) tempAx.push([t, parseFloat(cols[idxAx]) || 0])
+      if (idxAy >= 0) tempAy.push([t, parseFloat(cols[idxAy]) || 0])
+      if (idxAz >= 0) tempAz.push([t, parseFloat(cols[idxAz]) || 0])
+      if (idxGx >= 0) tempGx.push([t, parseFloat(cols[idxGx]) || 0])
+      if (idxGy >= 0) tempGy.push([t, parseFloat(cols[idxGy]) || 0])
+      if (idxGz >= 0) tempGz.push([t, parseFloat(cols[idxGz]) || 0])
+      if (idxAlt >= 0) tempBAlt.push([t, parseFloat(cols[idxAlt]) || 0])
+      
+      const lat = idxLat >= 0 ? parseFloat(cols[idxLat]) || 0 : 0
+      const lon = idxLon >= 0 ? parseFloat(cols[idxLon]) || 0 : 0
+      tempLat.push(lat)
+      tempLon.push(lon)
+      
+      let speed = 0;
+      if (prevLat && prevLon && prevT && lat !== 0 && lon !== 0) {
+        const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, lat, lon);
+        if (t - prevT > 0) speed = (distKm / (t - prevT)) * 3600;
       }
+      if (lat !== 0 && lon !== 0) { prevLat = lat; prevLon = lon; prevT = t; }
+      tempSpeed.push([t, speed])
+      
+      if (idxGAlt >= 0) tempGAlt.push([t, parseFloat(cols[idxGAlt]) || 0])
+      if (idxPdop >= 0) tempPdop.push([t, parseFloat(cols[idxPdop]) || 0])
+      if (idxSats >= 0) tempSats.push([t, parseFloat(cols[idxSats]) || 0])
+
+      if (idxVbus >= 0) tempVbus.push([t, parseFloat(cols[idxVbus]) || 0])
+      if (idxIq >= 0) tempIq.push([t, parseFloat(cols[idxIq]) || 0])
+      if (idxR1 >= 0) tempR1.push([t, parseFloat(cols[idxR1]) || 0])
+      if (idxR2 >= 0) tempR2.push([t, parseFloat(cols[idxR2]) || 0])
+      if (idxT1 >= 0) tempT1.push([t, parseFloat(cols[idxT1]) || 0])
+      if (idxT2 >= 0) tempT2.push([t, parseFloat(cols[idxT2]) || 0])
     }
   }
-  
-  // Assign arrays to Vue Refs
+
   timeHistory.value = tempTime
   accelX.value = tempAx; accelY.value = tempAy; accelZ.value = tempAz
   gyroX.value = tempGx; gyroY.value = tempGy; gyroZ.value = tempGz
   baroAlt.value = tempBAlt; gpsAlt.value = tempGAlt; speedHistory.value = tempSpeed
   pdopHistory.value = tempPdop; satsHistory.value = tempSats
   liveLats.value = tempLat; liveLons.value = tempLon
-  
+
+  vbusHistory.value = tempVbus
+  iqHistory.value = tempIq
+  r1History.value = tempR1
+  r2History.value = tempR2
+  t1History.value = tempT1
+  t2History.value = tempT2
+
   updateMapPath(tempLat, tempLon)
+  event.target.value = ''
 }
 
+// --- PETA LEAFLET UPDATE ---
 const updateMapPath = (lats, lons) => {
+  if (!mapInstance || !polyline || lats.length === 0) return
   const validLatLngs = []
   for (let i = 0; i < lats.length; i++) {
-    if (lats[i] !== 0 && lons[i] !== 0) validLatLngs.push([lats[i], lons[i]])
+    if (lats[i] !== 0 && lons[i] !== 0 && !isNaN(lats[i]) && !isNaN(lons[i])) {
+      validLatLngs.push([lats[i], lons[i]])
+    }
   }
   if (validLatLngs.length === 0) return
-  
   polyline.setLatLngs(validLatLngs)
   
   const greenIcon = new L.Icon({
@@ -467,7 +822,6 @@ const updateMapPath = (lats, lons) => {
   mapInstance.fitBounds(polyline.getBounds(), { padding: [20, 20] })
 }
 
-// Leaflet Map Initialization
 const initMap = () => {
   mapInstance = L.map('leaflet-map').setView([-7.321, 110.514], 16)
   L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
@@ -476,7 +830,6 @@ const initMap = () => {
   }).addTo(mapInstance)
   polyline = L.polyline([], {color: 'red', weight: 4}).addTo(mapInstance)
   
-  // Fix Icon Paths
   delete L.Icon.Default.prototype._getIconUrl;
   L.Icon.Default.mergeOptions({
     iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png',
@@ -484,7 +837,6 @@ const initMap = () => {
     shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
   });
 }
-
 
 onMounted(() => {
   initMap()
@@ -498,6 +850,7 @@ onMounted(() => {
       connectionTimeout = setTimeout(() => {
         isConnected.value = false
       }, 3000)
+
       const MAX_PTS = 120 
       const t = data.ts ? (data.ts / 1000) : (Date.now() / 1000)
       let speed = 0
@@ -515,8 +868,9 @@ onMounted(() => {
            if (dtSec > 0) speed = (distKm / dtSec) * 3600
          }
       }
-      speedHistory.value = [...speedHistory.value, [t, speed]].slice(-MAX_PTS)
+
       timeHistory.value = [...timeHistory.value, t].slice(-MAX_PTS)
+      speedHistory.value = [...speedHistory.value, [t, speed]].slice(-MAX_PTS)
       accelX.value = [...accelX.value, [t, data.ax || 0]].slice(-MAX_PTS)
       accelY.value = [...accelY.value, [t, data.ay || 0]].slice(-MAX_PTS)
       accelZ.value = [...accelZ.value, [t, data.az || 0]].slice(-MAX_PTS)
@@ -529,14 +883,32 @@ onMounted(() => {
       satsHistory.value = [...satsHistory.value, [t, data.ns || 0]].slice(-MAX_PTS)
       liveLats.value = [...liveLats.value, data.lat || 0].slice(-MAX_PTS)
       liveLons.value = [...liveLons.value, data.lon || 0].slice(-MAX_PTS)
+
+      // Parameter telemetri baru
+      const vb = (data.vbus !== undefined) ? data.vbus : (data.vb || 0)
+      const iq = (data.iq !== undefined) ? data.iq : 0
+      const r1 = (data.r1 !== undefined) ? data.r1 : (data.rpm1 || 0)
+      const r2 = (data.r2 !== undefined) ? data.r2 : (data.rpm2 || 0)
+      const t1 = (data.t1 !== undefined) ? data.t1 : (data.temp1 || 0)
+      const t2 = (data.t2 !== undefined) ? data.t2 : (data.temp2 || 0)
+
+      vbusHistory.value = [...vbusHistory.value, [t, vb]].slice(-MAX_PTS)
+      iqHistory.value = [...iqHistory.value, [t, iq]].slice(-MAX_PTS)
+      r1History.value = [...r1History.value, [t, r1]].slice(-MAX_PTS)
+      r2History.value = [...r2History.value, [t, r2]].slice(-MAX_PTS)
+      t1History.value = [...t1History.value, [t, t1]].slice(-MAX_PTS)
+      t2History.value = [...t2History.value, [t, t2]].slice(-MAX_PTS)
+
       updateMapPath(liveLats.value, liveLons.value)
+
       if (isRecording.value) {
         recordedData.value.push({
           time: Date.now(),
           ax: data.ax || 0, ay: data.ay || 0, az: data.az || 0,
           gx: data.gx || 0, gy: data.gy || 0, gz: data.gz || 0,
           alt: data.alt || 0, lat: data.lat || 0, lon: data.lon || 0,
-          galt: data.galt || 0, pd: data.pd || 0, ns: data.ns || 0
+          galt: data.galt || 0, pd: data.pd || 0, ns: data.ns || 0,
+          vbus: vb, iq: iq, r1: r1, r2: r2, t1: t1, t2: t2
         })
       }
     }
@@ -545,12 +917,57 @@ onMounted(() => {
 </script>
 
 <style scoped>
+/* Layout 50% / 50% split screen */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.map-column {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.charts-column {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
 .chart-title {
-  font-size: 1rem;
+  font-size: 0.95rem;
   font-weight: 600;
   color: #f1f5f9;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
+
+.chart-with-axis {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+}
+
+.axis-panel {
+  width: 85px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11px;
+  color: #94a3b8;
+}
+
 .axis-input {
   width: 100%;
   padding: 4px;
@@ -559,5 +976,23 @@ onMounted(() => {
   border: 1px solid #334155;
   color: #fff;
   margin-top: 2px;
+  font-family: monospace;
+}
+
+.quick-cli-btn {
+  background: #1e293b;
+  border: 1px solid #334155;
+  color: #38bdf8;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: monospace;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.quick-cli-btn:hover {
+  background: #334155;
+  color: #fff;
 }
 </style>

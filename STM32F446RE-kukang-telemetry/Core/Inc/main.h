@@ -65,6 +65,8 @@ void Error_Handler(void);
 #define SPI1_CS_IMU_GPIO_Port GPIOC
 #define USER_LED_Pin GPIO_PIN_2
 #define USER_LED_GPIO_Port GPIOB
+#define DS18B20_Pin GPIO_PIN_10
+#define DS18B20_GPIO_Port GPIOB
 #define SPI2_CS_Pin GPIO_PIN_12
 #define SPI2_CS_GPIO_Port GPIOB
 #define SDIO_DET_Pin GPIO_PIN_8

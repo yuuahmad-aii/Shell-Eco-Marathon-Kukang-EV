@@ -213,15 +213,54 @@ void Config_PrintAll(void) {
   cdc_printf("ok\r\n");
 }
 
+void Config_PrintCANStatus(void) {
+  extern FDCAN_HandleTypeDef hfdcan1;
+  extern volatile uint8_t can_motor_active;
+  extern volatile uint32_t last_can_cmd_tick;
+
+  uint32_t psr = hfdcan1.Instance->PSR;
+  uint32_t ecr = hfdcan1.Instance->ECR;
+  uint32_t txfqs = hfdcan1.Instance->TXFQS;
+  uint32_t cccr = hfdcan1.Instance->CCCR;
+
+  uint8_t bo = (psr & FDCAN_PSR_BO) ? 1 : 0;
+  uint8_t ew = (psr & FDCAN_PSR_EW) ? 1 : 0;
+  uint8_t ep = (psr & FDCAN_PSR_EP) ? 1 : 0;
+  uint8_t act = (uint8_t)((psr & FDCAN_PSR_ACT) >> FDCAN_PSR_ACT_Pos);
+  uint8_t lec = (uint8_t)((psr & FDCAN_PSR_LEC) >> FDCAN_PSR_LEC_Pos);
+
+  uint8_t tec = (uint8_t)((ecr & FDCAN_ECR_TEC) >> FDCAN_ECR_TEC_Pos);
+  uint8_t rec = (uint8_t)((ecr & FDCAN_ECR_REC) >> FDCAN_ECR_REC_Pos);
+
+  uint8_t tffl = (uint8_t)((txfqs & FDCAN_TXFQS_TFFL) >> FDCAN_TXFQS_TFFL_Pos);
+  uint8_t tfqf = (txfqs & FDCAN_TXFQS_TFQF) ? 1 : 0;
+
+  uint8_t pb8_rx = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_8);
+  uint8_t pb9_tx = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
+
+  cdc_printf("\r\n--- FDCAN1 Status ---\r\n");
+  cdc_printf("State: %d, CCCR.INIT: %d\r\n", (int)hfdcan1.State, (int)(cccr & FDCAN_CCCR_INIT ? 1 : 0));
+  cdc_printf("Bus-Off (BO): %d, Warn (EW): %d, Passive (EP): %d\r\n", bo, ew, ep);
+  cdc_printf("Activity (ACT): %d (0=Sync, 1=Idle, 2=Rx, 3=Tx)\r\n", act);
+  cdc_printf("Last Error (LEC): %d (0=None, 3=AckErr, 4=Bit1, 5=Bit0)\r\n", lec);
+  cdc_printf("Error Counters: TEC=%d, REC=%d\r\n", tec, rec);
+  cdc_printf("Tx FIFO: Free=%d/3, Full=%d\r\n", tffl, tfqf);
+  cdc_printf("Physical Pins: PB8(RX)=%d (must be 1 for Idle), PB9(TX)=%d\r\n", pb8_rx, pb9_tx);
+  cdc_printf("Motor CAN Active: %d (last cmd %lu ms ago)\r\n", can_motor_active, HAL_GetTick() - last_can_cmd_tick);
+  cdc_printf("ok\r\n");
+}
+
 void Config_PrintHelp(void) {
   cdc_printf("\r\n--- Commands ---\r\n");
   cdc_printf("$$      : Show all settings\r\n");
   cdc_printf("$x=y    : Set parameter x to value y\r\n");
   cdc_printf("$save   : Save settings to flash\r\n");
   cdc_printf("$?      : Show Hall & MOSFET states\r\n");
+  cdc_printf("$can    : Show FDCAN1 Bus Diagnostics\r\n");
   cdc_printf("$h      : Show this help\r\n");
   cdc_printf("S<val>  : Set Target Duty Cycle (%)\r\n");
   cdc_printf("T       : Stop Motor\r\n");
+  cdc_printf("C       : Show FDCAN1 Bus Diagnostics\r\n");
   cdc_printf("ok\r\n");
 }
 
@@ -234,6 +273,8 @@ void Config_ParseCommand(char *cmd_line) {
     } else if (cmd_line[1] == '?') {
       extern void SixStep_PrintDebug(void);
       SixStep_PrintDebug();
+    } else if (strncmp(&cmd_line[1], "can", 3) == 0) {
+      Config_PrintCANStatus();
     } else if (cmd_line[1] == 'h') {
       Config_PrintHelp();
     } else {
@@ -300,6 +341,8 @@ void Config_ParseCommand(char *cmd_line) {
   } else if (cmd_line[0] == 'T' || cmd_line[0] == 't') {
     SixStep_Stop();
     cdc_printf("Motor Stopped\r\n");
+  } else if (cmd_line[0] == 'C' || cmd_line[0] == 'c') {
+    Config_PrintCANStatus();
   } else {
     cdc_printf("error: Unknown command\r\n");
   }

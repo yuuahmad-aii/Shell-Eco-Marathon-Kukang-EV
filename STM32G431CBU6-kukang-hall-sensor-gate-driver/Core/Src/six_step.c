@@ -9,17 +9,23 @@
 #endif
 
 extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim2;
 
 // Hybrid control variables
 static float current_duty = 0.0f; // 0.0 to 100.0
 static uint8_t motor_running = 0;
-static uint8_t last_hall_state = 0;
+static volatile uint8_t current_hall_state = 0;
+static volatile uint8_t last_hall_state = 0;
+static volatile uint32_t last_capture_ticks = 0;
+static volatile uint32_t last_hall_tick = 0;
+static volatile uint8_t hall_edge_count = 0;
+static float tim2_tick_freq = 0.0f;
 
 static uint8_t Get_Hall_State(void);
 static int8_t Get_Hall_Direction(uint8_t current, uint8_t previous);
+static void SixStep_ApplyCommutation(uint8_t hall_state, uint32_t ccr_val);
 
-static float electrical_velocity = 0.0f; 
-static float time_since_hall = 0.0f;
+static volatile float electrical_velocity = 0.0f; 
 static float interpolated_angle = 0.0f;
 static float time_running = 0.0f;
 
@@ -50,12 +56,143 @@ static const float hall_angles[8] = {
 #define ENABLE_PHASE_W()  htim1.Instance->CCER |= (TIM_CCER_CC3E | TIM_CCER_CC3NE)
 #define DISABLE_PHASE_W() htim1.Instance->CCER &= ~(TIM_CCER_CC3E | TIM_CCER_CC3NE)
 
+static void SixStep_ApplyCommutation(uint8_t hall_state, uint32_t ccr_val) {
+    uint8_t comm_state = hall_state;
+    if (current_duty < 0.0f) {
+        // Reverse commutation by shifting 180 electrical degrees (3 states)
+        switch (comm_state) {
+            case 5: comm_state = 2; break;
+            case 1: comm_state = 6; break;
+            case 3: comm_state = 4; break;
+            case 2: comm_state = 5; break;
+            case 6: comm_state = 1; break;
+            case 4: comm_state = 3; break;
+            default: break;
+        }
+    }
+
+    switch (comm_state) {
+        case 5:
+            DISABLE_PHASE_W();
+            htim1.Instance->CCR1 = ccr_val;
+            htim1.Instance->CCR2 = 0;
+            ENABLE_PHASE_U();
+            ENABLE_PHASE_V();
+            break;
+        case 1:
+            DISABLE_PHASE_V();
+            htim1.Instance->CCR1 = ccr_val;
+            htim1.Instance->CCR3 = 0;
+            ENABLE_PHASE_U();
+            ENABLE_PHASE_W();
+            break;
+        case 3:
+            DISABLE_PHASE_U();
+            htim1.Instance->CCR2 = ccr_val;
+            htim1.Instance->CCR3 = 0;
+            ENABLE_PHASE_V();
+            ENABLE_PHASE_W();
+            break;
+        case 2:
+            DISABLE_PHASE_W();
+            htim1.Instance->CCR1 = 0;
+            htim1.Instance->CCR2 = ccr_val;
+            ENABLE_PHASE_U();
+            ENABLE_PHASE_V();
+            break;
+        case 6:
+            DISABLE_PHASE_V();
+            htim1.Instance->CCR1 = 0;
+            htim1.Instance->CCR3 = ccr_val;
+            ENABLE_PHASE_U();
+            ENABLE_PHASE_W();
+            break;
+        case 4:
+            DISABLE_PHASE_U();
+            htim1.Instance->CCR2 = 0;
+            htim1.Instance->CCR3 = ccr_val;
+            ENABLE_PHASE_V();
+            ENABLE_PHASE_W();
+            break;
+        default:
+            DISABLE_PHASE_U();
+            DISABLE_PHASE_V();
+            DISABLE_PHASE_W();
+            break;
+    }
+}
+
+/**
+ * @brief HAL Input Capture Callback for TIM2 Hall Sensor Interface
+ *        Automatically triggered on any Hall edge (XOR of PA0, PA1, PA2).
+ *        The hardware latches the counter into CCR1 and resets CNT to 0,
+ *        giving absolute nanosecond-precision delta-t measurement.
+ */
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM2) {
+        uint32_t capture = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+        uint8_t hall_state = Get_Hall_State();
+        uint32_t now_tick = HAL_GetTick();
+
+        if (hall_state >= 1 && hall_state <= 6) {
+            if (last_hall_state != 0 && last_hall_state != hall_state) {
+                int8_t dir = Get_Hall_Direction(hall_state, last_hall_state);
+
+                // Ignore invalid sequence jumps (dir == 0) caused by noise
+                if (dir != 0) {
+                    hall_edge_count++;
+
+                    // Minimum plausible tick count for 7 pole-pair motor:
+                    // At 6,000 RPM mechanical (42,000 electrical RPM), 60 deg is 238 us = ~34,000 ticks at 144MHz.
+                    // Reject any capture < 15,000 ticks (~104 us, >13,700 RPM) as electrical switching glitch.
+                    // Also require at least 2 edges so the first edge (from standstill/stall) is not used.
+                    if (hall_edge_count >= 2 && capture >= 15000 && tim2_tick_freq > 0.0f) {
+                        float dt_hall = (float)capture / tim2_tick_freq;
+                        float inst_vel = (float)dir * (M_PI / 3.0f) / dt_hall;
+
+                        // Clamp maximum plausible velocity:
+                        // 2500 rad/s electrical corresponds to ~3400 RPM mechanical for 7 pole pairs.
+                        if (fabsf(inst_vel) <= 2500.0f) {
+                            if (fabsf(electrical_velocity) < 1.0f) {
+                                electrical_velocity = inst_vel;
+                            } else {
+                                // Limit maximum change per Hall step to physical rotor acceleration limits
+                                float max_step_change = fabsf(electrical_velocity) * 0.7f + 50.0f;
+                                float diff = inst_vel - electrical_velocity;
+                                if (diff > max_step_change) inst_vel = electrical_velocity + max_step_change;
+                                if (diff < -max_step_change) inst_vel = electrical_velocity - max_step_change;
+
+                                // Filter out mechanical sensor placement asymmetry smoothly
+                                electrical_velocity = 0.2f * inst_vel + 0.8f * electrical_velocity;
+                            }
+                            last_capture_ticks = capture;
+                        }
+                    }
+                }
+            }
+            last_hall_state = hall_state;
+            current_hall_state = hall_state;
+            last_hall_tick = now_tick;
+
+            // Zero-latency instant phase commutation on edge in 6-step mode
+            if (motor_running && !svpwm_mode) {
+                uint32_t arr = htim1.Instance->ARR;
+                uint32_t ccr_val = (uint32_t)((fabsf(current_duty) / 100.0f) * arr);
+                SixStep_ApplyCommutation(hall_state, ccr_val);
+            }
+        }
+    }
+}
+
 void SixStep_Init(void) {
     current_duty = 0.0f;
     motor_running = 0;
+    current_hall_state = 0;
     last_hall_state = 0;
+    last_capture_ticks = 0;
+    last_hall_tick = 0;
+    hall_edge_count = 0;
     electrical_velocity = 0.0f;
-    time_since_hall = 0.0f;
     time_running = 0.0f;
     svpwm_mode = 0;
     
@@ -73,6 +210,27 @@ void SixStep_Init(void) {
     HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
     
     htim1.Instance->BDTR |= TIM_BDTR_MOE;
+
+    // Calculate TIM2 clock frequency dynamically
+    uint32_t pclk1 = HAL_RCC_GetPCLK1Freq();
+    RCC_ClkInitTypeDef clkConfig;
+    uint32_t flatency;
+    HAL_RCC_GetClockConfig(&clkConfig, &flatency);
+    uint32_t tim2_clock = (clkConfig.APB1CLKDivider == RCC_HCLK_DIV1) ? pclk1 : (pclk1 * 2);
+    tim2_tick_freq = (float)tim2_clock / (float)(htim2.Init.Prescaler + 1);
+    if (tim2_tick_freq <= 0.0f) {
+        tim2_tick_freq = (float)SystemCoreClock;
+    }
+
+    // Ensure 256-clock digital filter on TIM2 Channel 1 input in hardware
+    TIM2->CCMR1 = (TIM2->CCMR1 & ~TIM_CCMR1_IC1F) | (0x0F << TIM_CCMR1_IC1F_Pos);
+
+    // Start TIM2 Hall Sensor Interface in Interrupt mode
+    HAL_TIMEx_HallSensor_Start_IT(&htim2);
+
+    current_hall_state = Get_Hall_State();
+    last_hall_state = current_hall_state;
+    last_hall_tick = HAL_GetTick();
 }
 
 void SixStep_SetRPM(float setpoint_rpm) {
@@ -113,13 +271,21 @@ void SixStep_SetRPM(float setpoint_rpm) {
             DISABLE_PHASE_W();
             // ---------------------------------------
 
-            last_hall_state = Get_Hall_State();
+            current_hall_state = Get_Hall_State();
+            last_hall_state = current_hall_state;
+            last_hall_tick = HAL_GetTick();
+            last_capture_ticks = 0;
+            hall_edge_count = 0;
             electrical_velocity = 0.0f;
-            time_since_hall = 0.0f;
             time_running = 0.0f;
             ramped_rpm = 0.0f;
             vel_integral = (target_rpm > 0.0f) ? 10.0f : -10.0f; // Pre-load integral slightly to give initial kick
             current_duty = (target_rpm > 0.0f) ? 10.0f : -10.0f;
+
+            // Apply initial commutation step based on current Hall state
+            uint32_t arr = htim1.Instance->ARR;
+            uint32_t ccr_val = (uint32_t)((fabsf(current_duty) / 100.0f) * arr);
+            SixStep_ApplyCommutation(current_hall_state, ccr_val);
         }
         motor_running = 1;
     } else {
@@ -135,6 +301,9 @@ void SixStep_Stop(void) {
     ramped_rpm = 0.0f;
     vel_integral = 0.0f;
     current_duty = 0.0f;
+    electrical_velocity = 0.0f;
+    last_capture_ticks = 0;
+    hall_edge_count = 0;
     
     DISABLE_PHASE_U();
     DISABLE_PHASE_V();
@@ -190,7 +359,13 @@ static void SVPWM(float v_alpha, float v_beta, float *t_a, float *t_b, float *t_
 }
 
 void SixStep_Update(float dt) {
-    if (!motor_running) return;
+    if (!motor_running) {
+        electrical_velocity = 0.0f;
+        interpolated_angle = 0.0f;
+        current_duty = 0.0f;
+        vel_integral = 0.0f;
+        return;
+    }
 
     // Acceleration Limit
     if (motor_config.accel_rpm_s > 0.0f) {
@@ -205,24 +380,30 @@ void SixStep_Update(float dt) {
         ramped_rpm = target_rpm;
     }
 
-    time_since_hall += dt;
     time_running += dt;
-    uint8_t hall_state = Get_Hall_State();
-    
-    if (hall_state != last_hall_state) {
-        if (last_hall_state != 0 && time_since_hall > 0.0001f) {
-            int8_t dir = Get_Hall_Direction(hall_state, last_hall_state);
-            float inst_vel = dir * (M_PI / 3.0f) / time_since_hall;
-            // Simple low pass filter
-            electrical_velocity = 0.2f * inst_vel + 0.8f * electrical_velocity;
-        }
-        time_since_hall = 0.0f;
-        last_hall_state = hall_state;
+
+    // Elapsed time since last Hall edge obtained directly from TIM2 counter (absolute precision, zero polling jitter)
+    float time_since_hall = 0.0f;
+    if (tim2_tick_freq > 0.0f) {
+        time_since_hall = (float)htim2.Instance->CNT / tim2_tick_freq;
     }
 
-    if (time_since_hall > 0.2f) {
-        electrical_velocity = 0.0f; // Decay if stalled
+    // Timeout check: if no edge for > 200ms, the motor has stalled or stopped
+    if (HAL_GetTick() - last_hall_tick > 200) {
+        electrical_velocity = 0.0f;
+        hall_edge_count = 0;
+        time_since_hall = 0.2f;
+    } else if (last_capture_ticks > 0 && htim2.Instance->CNT > (last_capture_ticks * 2)) {
+        // Fast deceleration tracking: current step is taking longer than 2x previous step
+        float max_possible_vel = (M_PI / 3.0f) / time_since_hall;
+        if (electrical_velocity > max_possible_vel) {
+            electrical_velocity = max_possible_vel;
+        } else if (electrical_velocity < -max_possible_vel) {
+            electrical_velocity = -max_possible_vel;
+        }
     }
+
+    uint8_t hall_state = current_hall_state;
 
     // Calculate expected angle based on Hall sensors
     float hall_offset = motor_config.hall_offset_deg * M_PI / 180.0f;
@@ -256,17 +437,23 @@ void SixStep_Update(float dt) {
         interpolated_angle = expected_angle;
     }
 
-    // Calculate switchover velocity threshold dynamically
-    float switchover_velocity = 50.0f; // Default safe value
+    // --- Current RPM Calculation ---
+    float current_rpm = 0.0f;
     if (motor_config.pole_pairs > 0) {
-        switchover_velocity = motor_config.switchover_rpm * motor_config.pole_pairs * (2.0f * M_PI) / 60.0f;
+        current_rpm = electrical_velocity * 60.0f / (2.0f * M_PI * motor_config.pole_pairs);
     }
 
-    // Hysteresis for mode switching
+    // Mode switching: ONLY switch to SVPWM if commanded target is actually >= switchover_rpm
     uint8_t next_svpwm_mode = svpwm_mode;
-    if (time_running > motor_config.switchover_delay && fabsf(electrical_velocity) > switchover_velocity && fabsf(current_duty) > 5.0f) {
-        next_svpwm_mode = 1;
-    } else if (fabsf(electrical_velocity) < (switchover_velocity - 15.0f)) {
+    float switchover_rpm = motor_config.switchover_rpm;
+    if (switchover_rpm > 10.0f && fabsf(ramped_rpm) >= switchover_rpm) {
+        float min_delay = (motor_config.switchover_delay > 0.2f) ? motor_config.switchover_delay : 0.2f;
+        if (time_running > min_delay && fabsf(current_rpm) >= (switchover_rpm - 15.0f) && fabsf(current_duty) > 5.0f) {
+            next_svpwm_mode = 1;
+        } else if (fabsf(current_rpm) < (switchover_rpm - 30.0f)) {
+            next_svpwm_mode = 0;
+        }
+    } else {
         next_svpwm_mode = 0;
     }
     
@@ -280,27 +467,32 @@ void SixStep_Update(float dt) {
     }
     svpwm_mode = next_svpwm_mode;
 
-    // --- PI Velocity Controller ---
-    float current_rpm = 0.0f;
-    if (motor_config.pole_pairs > 0) {
-        current_rpm = electrical_velocity * 60.0f / (2.0f * M_PI * motor_config.pole_pairs);
-    }
-
+    // --- PI Velocity Controller with Direction-Constrained Limits ---
+    // Prevents severe plugging/reverse voltage spikes during forward drive
     float rpm_error = ramped_rpm - current_rpm;
     vel_integral += rpm_error * motor_config.vel_ki * dt;
     
-    // Anti-windup
     float max_duty = 95.0f; // Limit max duty for IR2110 bootstrap recharge
-    if (vel_integral > max_duty) vel_integral = max_duty;
-    if (vel_integral < -max_duty) vel_integral = -max_duty;
+    
+    if (ramped_rpm >= 0.0f) {
+        // Forward drive: duty must NEVER go negative into reverse plugging
+        if (vel_integral > max_duty) vel_integral = max_duty;
+        if (vel_integral < 0.0f) vel_integral = 0.0f;
 
-    float pi_out = (rpm_error * motor_config.vel_kp) + vel_integral;
-    
-    if (pi_out > max_duty) pi_out = max_duty;
-    if (pi_out < -max_duty) pi_out = -max_duty;
-    
-    current_duty = pi_out;
-    // ------------------------------
+        float pi_out = (rpm_error * motor_config.vel_kp) + vel_integral;
+        if (pi_out > max_duty) pi_out = max_duty;
+        if (pi_out < 0.0f) pi_out = 0.0f;
+        current_duty = pi_out;
+    } else {
+        // Reverse drive: duty must NEVER go positive
+        if (vel_integral < -max_duty) vel_integral = -max_duty;
+        if (vel_integral > 0.0f) vel_integral = 0.0f;
+
+        float pi_out = (rpm_error * motor_config.vel_kp) + vel_integral;
+        if (pi_out < -max_duty) pi_out = -max_duty;
+        if (pi_out > 0.0f) pi_out = 0.0f;
+        current_duty = pi_out;
+    }
 
     uint32_t arr = htim1.Instance->ARR;
     uint32_t ccr_val = (uint32_t)((fabsf(current_duty) / 100.0f) * arr);
@@ -321,67 +513,7 @@ void SixStep_Update(float dt) {
         htim1.Instance->CCR2 = (uint32_t)(tb * arr);
         htim1.Instance->CCR3 = (uint32_t)(tc * arr);
     } else {
-        uint8_t comm_state = hall_state;
-        if (current_duty < 0.0f) {
-            // Reverse commutation by shifting 180 electrical degrees (3 states)
-            switch (comm_state) {
-                case 5: comm_state = 2; break;
-                case 1: comm_state = 6; break;
-                case 3: comm_state = 4; break;
-                case 2: comm_state = 5; break;
-                case 6: comm_state = 1; break;
-                case 4: comm_state = 3; break;
-            }
-        }
-        // 6-step block commutation
-        switch (comm_state) {
-            case 5:
-                DISABLE_PHASE_W();
-                htim1.Instance->CCR1 = ccr_val;
-                htim1.Instance->CCR2 = 0;
-                ENABLE_PHASE_U();
-                ENABLE_PHASE_V();
-                break;
-            case 1:
-                DISABLE_PHASE_V();
-                htim1.Instance->CCR1 = ccr_val;
-                htim1.Instance->CCR3 = 0;
-                ENABLE_PHASE_U();
-                ENABLE_PHASE_W();
-                break;
-            case 3:
-                DISABLE_PHASE_U();
-                htim1.Instance->CCR2 = ccr_val;
-                htim1.Instance->CCR3 = 0;
-                ENABLE_PHASE_V();
-                ENABLE_PHASE_W();
-                break;
-            case 2:
-                DISABLE_PHASE_W();
-                htim1.Instance->CCR1 = 0;
-                htim1.Instance->CCR2 = ccr_val;
-                ENABLE_PHASE_U();
-                ENABLE_PHASE_V();
-                break;
-            case 6:
-                DISABLE_PHASE_V();
-                htim1.Instance->CCR1 = 0;
-                htim1.Instance->CCR3 = ccr_val;
-                ENABLE_PHASE_U();
-                ENABLE_PHASE_W();
-                break;
-            case 4:
-                DISABLE_PHASE_U();
-                htim1.Instance->CCR2 = 0;
-                htim1.Instance->CCR3 = ccr_val;
-                ENABLE_PHASE_V();
-                ENABLE_PHASE_W();
-                break;
-            default:
-                SixStep_Stop();
-                motor_running = 1; 
-                break;
-        }
+        SixStep_ApplyCommutation(hall_state, ccr_val);
     }
 }
 
@@ -392,14 +524,6 @@ void SixStep_PrintVerbose(void) {
     float rpm = 0.0f;
     if (motor_config.pole_pairs > 0) {
         rpm = electrical_velocity * 60.0f / (2.0f * M_PI * motor_config.pole_pairs);
-    }
-    
-    float duty_u = 0.0f, duty_v = 0.0f, duty_w = 0.0f;
-    uint32_t arr = htim1.Instance->ARR;
-    if (arr > 0) {
-        duty_u = (htim1.Instance->CCR1 / (float)arr) * 100.0f;
-        duty_v = (htim1.Instance->CCR2 / (float)arr) * 100.0f;
-        duty_w = (htim1.Instance->CCR3 / (float)arr) * 100.0f;
     }
     
     uint8_t mode = motor_running ? (svpwm_mode ? 2 : 1) : 0;

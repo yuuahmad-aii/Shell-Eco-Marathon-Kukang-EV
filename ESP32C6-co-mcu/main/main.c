@@ -8,6 +8,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include <stdio.h>
@@ -40,6 +41,12 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_FAIL_BIT BIT1
 
 static int s_retry_num = 0;
+
+// Thread-safe mailbox for passing latest telemetry from UART RX to Firebase TX task
+static TaskHandle_t s_firebase_task_handle = NULL;
+static SemaphoreHandle_t s_telemetry_mutex = NULL;
+static char s_latest_telemetry[BUF_SIZE];
+static bool s_new_telemetry_available = false;
 
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data) {
@@ -146,33 +153,75 @@ static void uart_init(void) {
 
 esp_err_t _http_event_handler(esp_http_client_event_t *evt) { return ESP_OK; }
 
-void send_to_firebase(const char *json_data) {
+static void firebase_tx_task(void *arg) {
   esp_http_client_config_t config = {
       .url = FIREBASE_URL,
       .event_handler = _http_event_handler,
       .transport_type = HTTP_TRANSPORT_OVER_SSL,
-      .skip_cert_common_name_check = true, // Bypass cert verification for testing
+      .skip_cert_common_name_check = true,
+      .keep_alive_enable = true, // Reuse SSL/TLS session to reduce latency from ~2.5s down to ~150ms
+      .timeout_ms = 4000,
   };
-  esp_http_client_handle_t client = esp_http_client_init(&config);
-  if (!client) {
-    ESP_LOGE(TAG, "Failed to initialise HTTP connection");
-    return;
+
+  esp_http_client_handle_t client = NULL;
+  char payload[BUF_SIZE];
+
+  while (1) {
+    // Wait for notification from uart_rx_task or wake up every 500ms
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+
+    // Ensure WiFi is connected before sending
+    EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+    if (!(bits & WIFI_CONNECTED_BIT)) {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    bool has_data = false;
+    if (s_telemetry_mutex != NULL && xSemaphoreTake(s_telemetry_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (s_new_telemetry_available) {
+        strncpy(payload, s_latest_telemetry, sizeof(payload) - 1);
+        payload[sizeof(payload) - 1] = '\0';
+        s_new_telemetry_available = false;
+        has_data = true;
+      }
+      xSemaphoreGive(s_telemetry_mutex);
+    }
+
+    if (!has_data) {
+      continue;
+    }
+
+    if (!client) {
+      client = esp_http_client_init(&config);
+      if (!client) {
+        ESP_LOGE(TAG, "Failed to initialize persistent HTTP client");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        continue;
+      }
+    }
+
+    esp_http_client_set_method(client, HTTP_METHOD_PUT);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, payload, strlen(payload));
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+      int status = esp_http_client_get_status_code(client);
+      if (status >= 200 && status < 300) {
+        ESP_LOGI(TAG, "Firebase PUT OK (%d)", status);
+      } else {
+        ESP_LOGW(TAG, "Firebase PUT unexpected status %d, resetting client", status);
+        esp_http_client_cleanup(client);
+        client = NULL;
+      }
+    } else {
+      ESP_LOGW(TAG, "HTTP PUT failed: %s, reconnecting...", esp_err_to_name(err));
+      esp_http_client_cleanup(client);
+      client = NULL;
+      vTaskDelay(pdMS_TO_TICKS(200));
+    }
   }
-
-  esp_http_client_set_method(client, HTTP_METHOD_PUT);
-  esp_http_client_set_header(client, "Content-Type", "application/json");
-  esp_http_client_set_post_field(client, json_data, strlen(json_data));
-
-  esp_err_t err = esp_http_client_perform(client);
-  if (err == ESP_OK) {
-    ESP_LOGI(TAG, "Firebase PUT Status = %d, content_length = %lld",
-             esp_http_client_get_status_code(client),
-             esp_http_client_get_content_length(client));
-  } else {
-    ESP_LOGE(TAG, "HTTP PUT request failed: %s", esp_err_to_name(err));
-  }
-
-  esp_http_client_cleanup(client);
 }
 
 static void uart_rx_task(void *arg) {
@@ -191,12 +240,12 @@ static void uart_rx_task(void *arg) {
         if (c == '\n') {
           line_buffer[line_len] = '\0';
 
-          // Filter out empty lines or garbage
-          if (line_len > 10 && line_buffer[0] == '{') {
-            ESP_LOGI(TAG, "Received Telemetry: %s", line_buffer);
+            // Strictly validate: must start with '{' and end with '}'
+          if (line_len > 10 && line_buffer[0] == '{' && line_buffer[line_len - 1] == '}') {
+            ESP_LOGI(TAG, "RAW JSON: %s", line_buffer);
 
             // Log extracted multi-sensor telemetry values
-            double vbus = 0, iq = 0, r1 = 0, r2 = 0, t1 = 0, t2 = 0;
+            double vbus = 0, iq = 0, r1 = 0, r2 = 0, t1 = 0, t2 = 0, sl = 0, sr = 0;
             char *p;
             if ((p = strstr(line_buffer, "\"vbus\":")) != NULL) vbus = atof(p + 7);
             if ((p = strstr(line_buffer, "\"iq\":")) != NULL) iq = atof(p + 5);
@@ -204,14 +253,26 @@ static void uart_rx_task(void *arg) {
             if ((p = strstr(line_buffer, "\"r2\":")) != NULL) r2 = atof(p + 5);
             if ((p = strstr(line_buffer, "\"t1\":")) != NULL) t1 = atof(p + 5);
             if ((p = strstr(line_buffer, "\"t2\":")) != NULL) t2 = atof(p + 5);
-            ESP_LOGI(TAG, "-> Parsed: Vbus=%.2fV, Iq=%.2fA, RPM1=%.0f, RPM2=%.0f, T1=%.2fC, T2=%.2fC",
-                     vbus, iq, r1, r2, t1, t2);
+            if ((p = strstr(line_buffer, "\"sl\":")) != NULL) sl = atof(p + 5);
+            if ((p = strstr(line_buffer, "\"sr\":")) != NULL) sr = atof(p + 5);
 
-            // Forward to Firebase if WiFi is connected
-            EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
-            if (bits & WIFI_CONNECTED_BIT) {
-              send_to_firebase(line_buffer);
+            ESP_LOGI(TAG, "-> Rx Telemetry: Vbus=%.2fV, Iq=%.2fA, RPM1=%.0f, RPM2=%.0f, T1=%.1fC, T2=%.1fC, Spd=%.1f/%.1f",
+                     vbus, iq, r1, r2, t1, t2, sl, sr);
+
+            // Copy to shared mailbox without blocking UART reception
+            if (s_telemetry_mutex != NULL && xSemaphoreTake(s_telemetry_mutex, 0) == pdTRUE) {
+              strncpy(s_latest_telemetry, line_buffer, sizeof(s_latest_telemetry) - 1);
+              s_latest_telemetry[sizeof(s_latest_telemetry) - 1] = '\0';
+              s_new_telemetry_available = true;
+              xSemaphoreGive(s_telemetry_mutex);
+
+              // Notify the Firebase transmission task immediately
+              if (s_firebase_task_handle != NULL) {
+                xTaskNotifyGive(s_firebase_task_handle);
+              }
             }
+          } else if (line_len > 0) {
+            ESP_LOGD(TAG, "Discarded incomplete or invalid frame (%d bytes)", line_len);
           }
           line_len = 0;
         } else if (c != '\r') {
@@ -238,6 +299,9 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(ret);
 
+  // Create telemetry mutex for thread-safe latest-frame mailbox
+  s_telemetry_mutex = xSemaphoreCreateMutex();
+
   ESP_LOGI(TAG, "Initializing WiFi...");
   wifi_init_sta();
 
@@ -247,7 +311,10 @@ void app_main(void) {
   ESP_LOGI(TAG, "Initializing UART...");
   uart_init();
 
+  ESP_LOGI(TAG, "Starting Firebase TX Task...");
+  xTaskCreate(firebase_tx_task, "firebase_tx_task", 1024 * 8, NULL, 5, &s_firebase_task_handle);
+
   ESP_LOGI(TAG, "Starting UART RX Task...");
-  xTaskCreate(uart_rx_task, "uart_rx_task", 1024 * 8, NULL,
+  xTaskCreate(uart_rx_task, "uart_rx_task", 1024 * 6, NULL,
               configMAX_PRIORITIES - 1, NULL);
 }

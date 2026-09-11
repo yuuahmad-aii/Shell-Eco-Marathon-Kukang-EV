@@ -45,3 +45,56 @@ Dasbor kontrol dan analitik komprehensif berbasis **Vue 3, Vite, dan ApexCharts*
 
 ### 6. [`python_gui/`](python_gui/readme.md)
 Kumpulan skrip utilitas berbasis **Python** (menggunakan `matplotlib`, `struct`, dsb). Berguna sebagai jembatan *backend offline* untuk melakukan dekode (*parsing*) terhadap file *binary* mentah dari SD Card yang berisi data *struct* C agar dapat dibaca oleh manusia dalam format `.csv`, dan alat plot darurat jika analisis sederhana diperlukan tanpa menyalakan *server web*.
+
+
+
+
+> $cal=2.0
+
+==================================================
+           HALL SENSOR CALIBRATION START          
+===================================
+===============
+DC Bus Voltage :  V
+C
+al Voltage    :  V (Duty: %)
+Pole Pairs     : 15
+Current Offset :  deg
+
+WARNING: Motor will rotate slowly in both directions.
+Ensure wheel is compl
+etely free to spin without load!
+
+[1/3] Lo
+cking rotor to Electrical 0 deg...
+      Rotor locked. Pha
+se Currents: U=A, V=A, W=A
+[2/3] Sweeping Electrica
+l Vector FORWARD (0 -> 720 deg)...
+[3/3] Sweeping Electrica
+l Vector REVERSE (720 -> 0 deg)...
+
+--------------------------------------------------
+                 CALIBRATION RESULT               
+-
+-------------------------------------------------
+Hall Sequence: 3 -> 2 -> 6 -> 4 -> 5 -> 1
+Direction    : NOR
+MAL (Setting $14=0)
+
+Sector Transitions (Electrical Degrees):
+  State 5: Fwd=, Rev= -> Mid= deg (Ref=, Diff=)
+  State 1: Fwd=, Rev= -> Mid= deg (Ref=, Diff=)
+  State 3: Fwd=, Rev= -> Mid= deg (Ref=, Diff=)
+  State 2: Fwd=, Rev= -> Mid= deg (Ref=, Diff=)
+  State 6: Fwd=, Rev= -> Mid= deg (Ref=, Diff=)
+  State 4: Fwd=, Rev= -> Mid= deg (Ref=, Diff=)
+
+Calculated Hall Offset :  deg
+Old Config Offset      :  deg
+
+SUCCESS: motor_config.hall_offset_deg updated to  deg!
+Type '$save' to permanently save this configuration to Flash.
+==================================================
+ok
+

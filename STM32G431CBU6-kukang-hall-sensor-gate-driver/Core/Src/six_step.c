@@ -571,3 +571,282 @@ void SixStep_PrintDebug(void) {
 float SixStep_GetElectricalAngle(void) {
     return interpolated_angle;
 }
+
+uint8_t SixStep_GetHallState(void) {
+    return Get_Hall_State();
+}
+
+// ==============================================================================
+// AUTOMATIC HALL SENSOR OFFSET CALIBRATION
+// ==============================================================================
+// Sweeps the electrical voltage vector quasi-statically in forward and reverse,
+// recording the exact electrical angle at every Hall sensor state transition.
+// Uses circular vector averaging to cancel rotor magnetic/friction lag and compute
+// the exact hall_offset_deg for optimal MTPA (Maximum Torque Per Ampere) FOC/SVPWM.
+// ==============================================================================
+void SixStep_CalibrateHall(float cal_voltage) {
+    extern float Get_DC_Bus_Voltage(void);
+    extern float Get_Current_U(void);
+    extern float Get_Current_V(void);
+    extern float Get_Current_W(void);
+    extern volatile uint8_t can_motor_active;
+    extern volatile uint32_t last_can_cmd_tick;
+
+    // 1. Safety stops & variable backup
+    SixStep_Stop();
+    can_motor_active = 0;
+    last_can_cmd_tick = HAL_GetTick();
+
+    uint32_t old_verbose = motor_config.verbose_output;
+    motor_config.verbose_output = 0; // Disable binary telemetry spam during calibration
+
+    float vbus = Get_DC_Bus_Voltage();
+    if (vbus < 8.0f) {
+        vbus = (motor_config.dc_bus_voltage > 8.0f) ? motor_config.dc_bus_voltage : 24.0f;
+    }
+
+    if (cal_voltage <= 0.5f) {
+        cal_voltage = (motor_config.open_loop_voltage >= 1.0f) ? motor_config.open_loop_voltage : 2.5f;
+    }
+
+    float duty = cal_voltage / vbus;
+    if (duty > 0.25f) duty = 0.25f; // Hard safety clamp to max 25% duty
+    if (duty < 0.03f) duty = 0.03f; // Min 3% duty
+
+    cdc_printf("\r\n==================================================\r\n");
+    cdc_printf("           HALL SENSOR CALIBRATION START          \r\n");
+    cdc_printf("==================================================\r\n");
+    cdc_printf("DC Bus Voltage : %.2f V\r\n", vbus);
+    cdc_printf("Cal Voltage    : %.2f V (Duty: %.1f%%)\r\n", cal_voltage, duty * 100.0f);
+    cdc_printf("Pole Pairs     : %lu\r\n", motor_config.pole_pairs);
+    cdc_printf("Current Offset : %.2f deg\r\n\r\n", motor_config.hall_offset_deg);
+    cdc_printf("WARNING: Motor will rotate slowly in both directions.\r\n");
+    cdc_printf("Ensure wheel is completely free to spin without load!\r\n\r\n");
+
+    // Pre-check Hall sensor pins
+    uint8_t init_hall = Get_Hall_State();
+    if (init_hall == 0 || init_hall == 7) {
+        cdc_printf("[CAL] ERROR: Invalid Hall State (%d)!\r\n", init_hall);
+        cdc_printf("[CAL] Check 5V power, GND, and pull-up resistors on PA0, PA1, PA2.\r\n");
+        cdc_printf("==================================================\r\n");
+        motor_config.verbose_output = old_verbose;
+        return;
+    }
+
+    // 2. Pre-charge IR2110 bootstrap capacitors (LIN=1, HIN=0)
+    htim1.Instance->CCR1 = 0;
+    htim1.Instance->CCR2 = 0;
+    htim1.Instance->CCR3 = 0;
+    ENABLE_PHASE_U();
+    ENABLE_PHASE_V();
+    ENABLE_PHASE_W();
+    HAL_Delay(10);
+
+    uint32_t arr = htim1.Instance->ARR;
+
+    // 3. Step 1: Lock rotor to Electrical 0 deg
+    cdc_printf("[1/3] Locking rotor to Electrical 0 deg...\r\n");
+    for (int step = 0; step <= 50; step++) {
+        float ramp = duty * ((float)step / 50.0f);
+        float ta, tb, tc;
+        SVPWM(ramp, 0.0f, &ta, &tb, &tc);
+        htim1.Instance->CCR1 = (uint32_t)(ta * arr);
+        htim1.Instance->CCR2 = (uint32_t)(tb * arr);
+        htim1.Instance->CCR3 = (uint32_t)(tc * arr);
+        HAL_Delay(10);
+    }
+    HAL_Delay(1000); // 1 sec steady hold
+
+    cdc_printf("      Rotor locked. Phase Currents: U=%.2fA, V=%.2fA, W=%.2fA\r\n",
+               Get_Current_U(), Get_Current_V(), Get_Current_W());
+
+    // 4. Step 2: Forward Electrical Sweep (0 -> 720 deg, 2 electrical cycles)
+    cdc_printf("[2/3] Sweeping Electrical Vector FORWARD (0 -> 720 deg)...\r\n");
+    float fwd_edge[8] = {0};
+    uint8_t fwd_seen[8] = {0};
+    uint8_t fwd_seq[16] = {0};
+    uint8_t fwd_seq_count = 0;
+
+    uint8_t prev_hall = Get_Hall_State();
+    const int total_steps = 2000; // 2000 * 2ms = 4000ms (4 seconds)
+    float delta_theta = (4.0f * M_PI) / (float)total_steps;
+    float theta = 0.0f;
+
+    for (int i = 0; i <= total_steps; i++) {
+        theta = (float)i * delta_theta;
+        float v_alpha = duty * cosf(theta);
+        float v_beta  = duty * sinf(theta);
+        float ta, tb, tc;
+        SVPWM(v_alpha, v_beta, &ta, &tb, &tc);
+        htim1.Instance->CCR1 = (uint32_t)(ta * arr);
+        htim1.Instance->CCR2 = (uint32_t)(tb * arr);
+        htim1.Instance->CCR3 = (uint32_t)(tc * arr);
+        HAL_Delay(2);
+
+        // Read Hall state
+        uint8_t h_curr = Get_Hall_State();
+        if (h_curr != prev_hall && h_curr >= 1 && h_curr <= 6) {
+            // In second electrical cycle (theta >= 2*PI), record entry angle
+            if (theta >= (2.0f * M_PI)) {
+                float theta_deg = fmodf(theta * 180.0f / M_PI, 360.0f);
+                if (!fwd_seen[h_curr]) {
+                    fwd_edge[h_curr] = theta_deg;
+                    fwd_seen[h_curr] = 1;
+                    if (fwd_seq_count < 15) {
+                        fwd_seq[fwd_seq_count++] = h_curr;
+                    }
+                }
+            }
+            prev_hall = h_curr;
+        }
+    }
+    HAL_Delay(300);
+
+    // 5. Step 3: Reverse Electrical Sweep (720 -> 0 deg)
+    cdc_printf("[3/3] Sweeping Electrical Vector REVERSE (720 -> 0 deg)...\r\n");
+    float rev_edge[8] = {0};
+    uint8_t rev_seen[8] = {0};
+    prev_hall = Get_Hall_State();
+
+    for (int i = total_steps; i >= 0; i--) {
+        theta = (float)i * delta_theta;
+        float v_alpha = duty * cosf(theta);
+        float v_beta  = duty * sinf(theta);
+        float ta, tb, tc;
+        SVPWM(v_alpha, v_beta, &ta, &tb, &tc);
+        htim1.Instance->CCR1 = (uint32_t)(ta * arr);
+        htim1.Instance->CCR2 = (uint32_t)(tb * arr);
+        htim1.Instance->CCR3 = (uint32_t)(tc * arr);
+        HAL_Delay(2);
+
+        uint8_t h_curr = Get_Hall_State();
+        if (h_curr != prev_hall && h_curr >= 1 && h_curr <= 6) {
+            // When exiting prev_hall in reverse, that marks the same boundary as entering prev_hall in forward!
+            if (theta <= (2.0f * M_PI)) {
+                float theta_deg = fmodf(theta * 180.0f / M_PI, 360.0f);
+                if (prev_hall >= 1 && prev_hall <= 6 && !rev_seen[prev_hall]) {
+                    rev_edge[prev_hall] = theta_deg;
+                    rev_seen[prev_hall] = 1;
+                }
+            }
+            prev_hall = h_curr;
+        }
+    }
+
+    // Ramp down and float phases safely
+    for (int step = 30; step >= 0; step--) {
+        float ramp = duty * ((float)step / 30.0f);
+        float ta, tb, tc;
+        SVPWM(ramp, 0.0f, &ta, &tb, &tc);
+        htim1.Instance->CCR1 = (uint32_t)(ta * arr);
+        htim1.Instance->CCR2 = (uint32_t)(tb * arr);
+        htim1.Instance->CCR3 = (uint32_t)(tc * arr);
+        HAL_Delay(5);
+    }
+    SixStep_Stop();
+
+    // 6. Data Validation & Offset Calculation
+    int valid_fwd_count = 0;
+    int valid_rev_count = 0;
+    const uint8_t valid_states[6] = {5, 1, 3, 2, 6, 4};
+
+    for (int idx = 0; idx < 6; idx++) {
+        uint8_t s = valid_states[idx];
+        if (fwd_seen[s]) valid_fwd_count++;
+        if (rev_seen[s]) valid_rev_count++;
+    }
+
+    if (valid_fwd_count < 6 || valid_rev_count < 6) {
+        cdc_printf("\r\n--------------------------------------------------\r\n");
+        cdc_printf("[CAL] ERROR: Incomplete Hall pattern detected!\r\n");
+        cdc_printf("Forward states detected: %d/6, Reverse states: %d/6\r\n", valid_fwd_count, valid_rev_count);
+        cdc_printf("Possible causes:\r\n");
+        cdc_printf(" 1. Calibration voltage too low for hub motor cogging torque.\r\n");
+        cdc_printf("    -> Try running with higher voltage: '$cal=3.5' or '$cal=4.0'\r\n");
+        cdc_printf(" 2. Broken Hall sensor line or loose connector.\r\n");
+        cdc_printf(" 3. Wheel was held or jammed during calibration.\r\n");
+        cdc_printf("==================================================\r\n");
+        motor_config.verbose_output = old_verbose;
+        return;
+    }
+
+    // Direction detection
+    // Expected normal: 5 -> 1 -> 3 -> 2 -> 6 -> 4 -> ...
+    // Expected inverted: 5 -> 4 -> 6 -> 2 -> 3 -> 1 -> ...
+    uint8_t detected_inverted = 0;
+    if (fwd_seq_count >= 2) {
+        if (fwd_seq[0] == 5 && fwd_seq[1] == 4) detected_inverted = 1;
+        else if (fwd_seq[0] == 1 && fwd_seq[1] == 5) detected_inverted = 1;
+        else if (fwd_seq[0] == 3 && fwd_seq[1] == 1) detected_inverted = 1;
+        else if (fwd_seq[0] == 2 && fwd_seq[1] == 3) detected_inverted = 1;
+        else if (fwd_seq[0] == 6 && fwd_seq[1] == 2) detected_inverted = 1;
+        else if (fwd_seq[0] == 4 && fwd_seq[1] == 6) detected_inverted = 1;
+    }
+
+    cdc_printf("\r\n--------------------------------------------------\r\n");
+    cdc_printf("                 CALIBRATION RESULT               \r\n");
+    cdc_printf("--------------------------------------------------\r\n");
+    cdc_printf("Hall Sequence: ");
+    for (int i = 0; i < fwd_seq_count; i++) {
+        cdc_printf("%d%s", fwd_seq[i], (i < fwd_seq_count - 1) ? " -> " : "");
+    }
+    cdc_printf("\r\n");
+    cdc_printf("Direction    : %s (Setting $14=%d)\r\n\r\n",
+               detected_inverted ? "INVERTED" : "NORMAL", detected_inverted);
+
+    cdc_printf("Sector Transitions (Electrical Degrees):\r\n");
+    float sum_sin = 0.0f;
+    float sum_cos = 0.0f;
+
+    for (int idx = 0; idx < 6; idx++) {
+        uint8_t s = valid_states[idx];
+        float f_deg = fwd_edge[s];
+        float r_deg = rev_edge[s];
+
+        // Circular midpoint
+        float f_rad = f_deg * M_PI / 180.0f;
+        float r_rad = r_deg * M_PI / 180.0f;
+        float mid_rad = atan2f(sinf(f_rad) + sinf(r_rad), cosf(f_rad) + cosf(r_rad));
+        float mid_deg = mid_rad * 180.0f / M_PI;
+        while (mid_deg < 0.0f) mid_deg += 360.0f;
+        while (mid_deg >= 360.0f) mid_deg -= 360.0f;
+
+        float ref_deg = hall_angles[s] * 180.0f / M_PI;
+
+        // Offset = (mid_deg + 90.0) - ref_deg
+        float off = mid_deg + 90.0f - ref_deg;
+        while (off < 0.0f) off += 360.0f;
+        while (off >= 360.0f) off -= 360.0f;
+
+        float off_rad = off * M_PI / 180.0f;
+        sum_sin += sinf(off_rad);
+        sum_cos += cosf(off_rad);
+
+        float diff = mid_deg - ref_deg;
+        if (diff > 180.0f) diff -= 360.0f;
+        if (diff < -180.0f) diff += 360.0f;
+
+        cdc_printf("  State %d: Fwd=%5.1f, Rev=%5.1f -> Mid=%5.1f deg (Ref=%5.1f, Diff=%+5.1f)\r\n",
+                   s, f_deg, r_deg, mid_deg, ref_deg, diff);
+    }
+
+    // Circular vector average across all 6 sectors
+    float final_offset_rad = atan2f(sum_sin, sum_cos);
+    float final_offset_deg = final_offset_rad * 180.0f / M_PI;
+    while (final_offset_deg < 0.0f) final_offset_deg += 360.0f;
+    while (final_offset_deg >= 360.0f) final_offset_deg -= 360.0f;
+
+    cdc_printf("\r\nCalculated Hall Offset : %.2f deg\r\n", final_offset_deg);
+    cdc_printf("Old Config Offset      : %.2f deg\r\n\r\n", motor_config.hall_offset_deg);
+
+    // Automatically update config in RAM
+    motor_config.hall_offset_deg = final_offset_deg;
+    motor_config.invert_direction = detected_inverted;
+
+    cdc_printf("SUCCESS: motor_config.hall_offset_deg updated to %.2f deg!\r\n", final_offset_deg);
+    cdc_printf("Type '$save' to permanently save this configuration to Flash.\r\n");
+    cdc_printf("==================================================\r\n");
+    cdc_printf("ok\r\n");
+
+    motor_config.verbose_output = old_verbose;
+}

@@ -179,15 +179,24 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 {
   DRESULT res = RES_ERROR;
 
-  if(BSP_SD_WriteBlocks((uint32_t*)buff,
-                        (uint32_t)(sector),
-                        count, SD_TIMEOUT) == MSD_OK)
+  for (int retry = 0; retry < 3; retry++)
   {
-	/* wait until the Write operation is finished */
-    while(BSP_SD_GetCardState() != MSD_OK)
+    if(BSP_SD_WriteBlocks((uint32_t*)buff,
+                          (uint32_t)(sector),
+                          count, SD_TIMEOUT) == MSD_OK)
     {
+      /* wait until the Write operation is finished with timeout */
+      uint32_t wait_start = HAL_GetTick();
+      while((BSP_SD_GetCardState() != MSD_OK) && ((HAL_GetTick() - wait_start) < 2000))
+      {
+      }
+      if (BSP_SD_GetCardState() == MSD_OK)
+      {
+        res = RES_OK;
+        break;
+      }
     }
-    res = RES_OK;
+    HAL_Delay(2);
   }
 
   return res;

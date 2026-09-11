@@ -29,7 +29,7 @@
       </label>
 
       <div class="status" :class="isConnected ? 'status-connected' : (isOfflineMode ? 'status-offline' : 'status-disconnected')">
-        {{ isConnected ? 'Live Connection' : (isOfflineMode ? 'Offline Log Mode' : 'Connecting...') }}
+        {{ isConnected ? 'Live Connection' : (isOfflineMode ? 'Offline Log Mode' : 'Disconnected') }}
       </div>
     </Teleport>
 
@@ -251,7 +251,7 @@ const t2History = shallowRef([])
 // --- AXIS BOUNDS REFS ---
 const elecYMax = ref(60)
 const elecYMin = ref(-10)
-const rpmYMax = ref(1000)
+const rpmYMax = ref(2000)
 const rpmYMin = ref(0)
 const tempYMax = ref(80)
 const tempYMin = ref(0)
@@ -447,9 +447,9 @@ const toggleRecording = () => {
       return
     }
     
-    let csv = "Time,Ax,Ay,Az,Gx,Gy,Gz,BaroAlt,Lat,Lon,GPSAlt,PDOP,Satellites,Vbus,Iq,RPM_TIM2CH1,RPM_TIM5CH2,Temp1,Temp2\n"
+    let csv = "Time,Timestamp_ms,Ax,Ay,Az,Gx,Gy,Gz,BaroAlt,Lat,Lon,GPSAlt,PDOP,Satellites,SpeedLeft,SpeedRight,SpeedAvg,Vbus,Iq,RPM_TIM2CH1,RPM_TIM5CH2,Temp1,Temp2\n"
     recordedData.value.forEach(r => {
-      csv += `${r.time},${r.ax},${r.ay},${r.az},${r.gx},${r.gy},${r.gz},${r.alt},${r.lat},${r.lon},${r.galt},${r.pd},${r.ns},${r.vbus ?? 0},${r.iq ?? 0},${r.r1 ?? 0},${r.r2 ?? 0},${r.t1 ?? 0},${r.t2 ?? 0}\n`
+      csv += `${r.time},${r.ts ?? 0},${r.ax},${r.ay},${r.az},${r.gx},${r.gy},${r.gz},${r.alt},${r.lat},${r.lon},${r.galt},${r.pd},${r.ns},${r.sl ?? 0},${r.sr ?? 0},${r.speed ?? 0},${r.vbus ?? 0},${r.iq ?? 0},${r.r1 ?? 0},${r.r2 ?? 0},${r.t1 ?? 0},${r.t2 ?? 0}\n`
     })
     
     const blob = new Blob([csv], { type: 'text/csv' })
@@ -597,6 +597,34 @@ const gpsSeries = computed(() => [
 ])
 
 // --- FILE UPLOAD & LOG PARSER ---
+// Helper validasi header record binary:
+// Memeriksa apakah header masuk akal (year: 1980 / 2020..2035, month: 1..12, day: 1..31, hour/min/sec wajar)
+const isValidRecordHeader = (view, offset, bufLen) => {
+  if (offset + 12 > bufLen) return false
+  const yr = view.getUint16(offset + 4, true)
+  const mo = view.getUint8(offset + 6)
+  const day = view.getUint8(offset + 7)
+  const hr = view.getUint8(offset + 8)
+  const mi = view.getUint8(offset + 9)
+  const se = view.getUint8(offset + 10)
+  const tv = view.getUint8(offset + 11)
+
+  if (yr !== 1980 && (yr < 2020 || yr > 2035)) return false
+  if (mo < 1 || mo > 12) return false
+  if (day < 1 || day > 31) return false
+  if (hr > 23 || mi > 59 || se > 59) return false
+  if (tv !== 0 && tv !== 1) return false
+  return true
+}
+
+const isSaneFloat = (val) => {
+  if (val === null || val === undefined || isNaN(val) || !isFinite(val)) return false
+  const abs = Math.abs(val)
+  if (abs > 1e12) return false
+  if (abs > 0 && abs < 1e-15) return false
+  return true
+}
+
 const convertBinToCsv = async (event) => {
   const file = event.target.files[0]
   if (!file) return
@@ -604,41 +632,94 @@ const convertBinToCsv = async (event) => {
   const buffer = await file.arrayBuffer()
   const view = new DataView(buffer)
   let offset = 0
-  const structLen = 58
   
-  let csv = "Timestamp_ms,GPS_Year,GPS_Month,GPS_Day,GPS_Hour,GPS_Min,GPS_Sec,Time_Valid,Accel_X(G),Accel_Y(G),Accel_Z(G),Gyro_X(deg/s),Gyro_Y(deg/s),Gyro_Z(deg/s),Baro_Altitude(m),Latitude,Longitude,GPS_Altitude(m),PDOP,Fix_Type,Satellites\n"
+  // Deteksi format otomatis dengan memvalidasi timestamp sekuensial
+  let is90Byte = false
+  if (buffer.byteLength >= 116) {
+    const ts0 = view.getUint32(0, true)
+    const ts58 = view.getUint32(58, true)
+    const ts90 = (buffer.byteLength >= 180) ? view.getUint32(90, true) : 0xFFFFFFFF
+    const is58Valid = (ts58 >= ts0 && (ts58 - ts0) < 10000) && isValidRecordHeader(view, 58, buffer.byteLength)
+    const is90Valid = (ts90 >= ts0 && (ts90 - ts0) < 10000) && isValidRecordHeader(view, 90, buffer.byteLength)
+    if (is90Valid && !is58Valid) is90Byte = true
+    else if (is58Valid && !is90Valid) is90Byte = false
+    else if (buffer.byteLength % 90 === 0 && buffer.byteLength % 58 !== 0) is90Byte = true
+    else if (buffer.byteLength % 58 === 0 && buffer.byteLength % 90 !== 0) is90Byte = false
+    else is90Byte = (buffer.byteLength % 90 === 0)
+  }
+  const structLen = is90Byte ? 90 : 58
+  
+  const header = is90Byte
+    ? "Timestamp_ms,GPS_Year,GPS_Month,GPS_Day,GPS_Hour,GPS_Min,GPS_Sec,Time_Valid,Accel_X(G),Accel_Y(G),Accel_Z(G),Gyro_X(deg/s),Gyro_Y(deg/s),Gyro_Z(deg/s),Baro_Altitude(m),Latitude,Longitude,GPS_Altitude(m),PDOP,Fix_Type,Satellites,SpeedLeft,SpeedRight,Vbus,Iq,RPM_TIM2CH1,RPM_TIM5CH2,Temp1,Temp2\n"
+    : "Timestamp_ms,GPS_Year,GPS_Month,GPS_Day,GPS_Hour,GPS_Min,GPS_Sec,Time_Valid,Accel_X(G),Accel_Y(G),Accel_Z(G),Gyro_X(deg/s),Gyro_Y(deg/s),Gyro_Z(deg/s),Baro_Altitude(m),Latitude,Longitude,GPS_Altitude(m),PDOP,Fix_Type,Satellites\n"
+  
+  const rows = [header]
   
   while (offset + structLen <= buffer.byteLength) {
-    const ts = view.getUint32(offset, true)
-    const yr = view.getUint16(offset + 4, true)
-    const mo = view.getUint8(offset + 6)
-    const day = view.getUint8(offset + 7)
-    const hr = view.getUint8(offset + 8)
-    const mi = view.getUint8(offset + 9)
-    const se = view.getUint8(offset + 10)
-    const tv = view.getUint8(offset + 11)
-    
-    const ax = view.getFloat32(offset + 12, true).toFixed(6)
-    const ay = view.getFloat32(offset + 16, true).toFixed(6)
-    const az = view.getFloat32(offset + 20, true).toFixed(6)
-    const gx = view.getFloat32(offset + 24, true).toFixed(6)
-    const gy = view.getFloat32(offset + 28, true).toFixed(6)
-    const gz = view.getFloat32(offset + 32, true).toFixed(6)
-    const alt = view.getFloat32(offset + 36, true).toFixed(2)
-    
-    const lat = view.getFloat32(offset + 40, true).toFixed(7)
-    const lon = view.getFloat32(offset + 44, true).toFixed(7)
-    const galt = view.getFloat32(offset + 48, true).toFixed(2)
-    const pdop = view.getFloat32(offset + 52, true).toFixed(2)
-    
-    const fix = view.getUint8(offset + 56)
-    const sats = view.getUint8(offset + 57)
-    
-    csv += `${ts},${yr},${mo},${day},${hr},${mi},${se},${tv},${ax},${ay},${az},${gx},${gy},${gz},${alt},${lat},${lon},${galt},${pdop},${fix},${sats}\n`
-    offset += structLen
+    if (isValidRecordHeader(view, offset, buffer.byteLength)) {
+      const ts = view.getUint32(offset, true)
+      const yr = view.getUint16(offset + 4, true)
+      const mo = view.getUint8(offset + 6)
+      const day = view.getUint8(offset + 7)
+      const hr = view.getUint8(offset + 8)
+      const mi = view.getUint8(offset + 9)
+      const se = view.getUint8(offset + 10)
+      const tv = view.getUint8(offset + 11)
+      
+      const ax = view.getFloat32(offset + 12, true)
+      const ay = view.getFloat32(offset + 16, true)
+      const az = view.getFloat32(offset + 20, true)
+      const gx = view.getFloat32(offset + 24, true)
+      const gy = view.getFloat32(offset + 28, true)
+      const gz = view.getFloat32(offset + 32, true)
+      const alt = view.getFloat32(offset + 36, true)
+      
+      const lat = view.getFloat32(offset + 40, true)
+      const lon = view.getFloat32(offset + 44, true)
+      const galt = view.getFloat32(offset + 48, true)
+      const pdop = view.getFloat32(offset + 52, true)
+      
+      const fix = view.getUint8(offset + 56)
+      const sats = view.getUint8(offset + 57)
+      
+      if (is90Byte) {
+        const sl = view.getFloat32(offset + 58, true)
+        const sr = view.getFloat32(offset + 62, true)
+        const vbus = view.getFloat32(offset + 66, true)
+        const iq = view.getFloat32(offset + 70, true)
+        const r1 = view.getFloat32(offset + 74, true)
+        const r2 = view.getFloat32(offset + 78, true)
+        const t1 = view.getFloat32(offset + 82, true)
+        const t2 = view.getFloat32(offset + 86, true)
+
+        if (isSaneFloat(ax) && isSaneFloat(ay) && isSaneFloat(az) &&
+            isSaneFloat(gx) && isSaneFloat(gy) && isSaneFloat(gz) &&
+            isSaneFloat(alt) && isSaneFloat(lat) && isSaneFloat(lon) &&
+            isSaneFloat(galt) && isSaneFloat(pdop) &&
+            isSaneFloat(sl) && isSaneFloat(sr) && isSaneFloat(vbus) &&
+            isSaneFloat(iq) && isSaneFloat(r1) && isSaneFloat(r2) &&
+            isSaneFloat(t1) && isSaneFloat(t2)) {
+          rows.push(`${ts},${yr},${mo},${day},${hr},${mi},${se},${tv},${ax.toFixed(4)},${ay.toFixed(4)},${az.toFixed(4)},${gx.toFixed(2)},${gy.toFixed(2)},${gz.toFixed(2)},${alt.toFixed(2)},${lat.toFixed(7)},${lon.toFixed(7)},${galt.toFixed(2)},${pdop.toFixed(2)},${fix},${sats},${sl.toFixed(2)},${sr.toFixed(2)},${vbus.toFixed(2)},${iq.toFixed(2)},${r1.toFixed(0)},${r2.toFixed(0)},${t1.toFixed(2)},${t2.toFixed(2)}\n`)
+        }
+      } else {
+        if (isSaneFloat(ax) && isSaneFloat(ay) && isSaneFloat(az) &&
+            isSaneFloat(gx) && isSaneFloat(gy) && isSaneFloat(gz) &&
+            isSaneFloat(alt) && isSaneFloat(lat) && isSaneFloat(lon) &&
+            isSaneFloat(galt) && isSaneFloat(pdop)) {
+          rows.push(`${ts},${yr},${mo},${day},${hr},${mi},${se},${tv},${ax.toFixed(4)},${ay.toFixed(4)},${az.toFixed(4)},${gx.toFixed(2)},${gy.toFixed(2)},${gz.toFixed(2)},${alt.toFixed(2)},${lat.toFixed(7)},${lon.toFixed(7)},${galt.toFixed(2)},${pdop.toFixed(2)},${fix},${sats}\n`)
+        }
+      }
+      offset += structLen
+    } else {
+      offset += 1
+      while (offset + structLen <= buffer.byteLength) {
+        if (isValidRecordHeader(view, offset, buffer.byteLength)) break
+        offset += 1
+      }
+    }
   }
   
-  const blob = new Blob([csv], { type: 'text/csv' })
+  const blob = new Blob(rows, { type: 'text/csv' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
@@ -666,14 +747,56 @@ const handleFileUpload = async (event) => {
   if (file.name.endsWith('.bin')) {
     const buffer = await file.arrayBuffer()
     const view = new DataView(buffer)
-    let offset = 0
-    const structLen = 58
     
-    const totalStructs = Math.floor(buffer.byteLength / structLen)
-    const step = Math.max(1, Math.floor(totalStructs / 400))
+    // Deteksi format otomatis dengan memvalidasi timestamp sekuensial
+    let is90Byte = false
+    if (buffer.byteLength >= 116) {
+      const ts0 = view.getUint32(0, true)
+      const ts58 = view.getUint32(58, true)
+      const ts90 = (buffer.byteLength >= 180) ? view.getUint32(90, true) : 0xFFFFFFFF
+      const is58Valid = (ts58 >= ts0 && (ts58 - ts0) < 10000) && isValidRecordHeader(view, 58, buffer.byteLength)
+      const is90Valid = (ts90 >= ts0 && (ts90 - ts0) < 10000) && isValidRecordHeader(view, 90, buffer.byteLength)
+      if (is90Valid && !is58Valid) is90Byte = true
+      else if (is58Valid && !is90Valid) is90Byte = false
+      else if (buffer.byteLength % 90 === 0 && buffer.byteLength % 58 !== 0) is90Byte = true
+      else if (buffer.byteLength % 58 === 0 && buffer.byteLength % 90 !== 0) is90Byte = false
+      else is90Byte = (buffer.byteLength % 90 === 0)
+    }
+    const structLen = is90Byte ? 90 : 58
+
+    // Kumpulkan seluruh offset record yang valid (resilient frame sync)
+    const validOffsets = []
+    let scanOffset = 0
+    while (scanOffset + structLen <= buffer.byteLength) {
+      if (isValidRecordHeader(view, scanOffset, buffer.byteLength)) {
+        const lat = view.getFloat32(scanOffset + 40, true)
+        const lon = view.getFloat32(scanOffset + 44, true)
+        if (isSaneFloat(lat) && isSaneFloat(lon)) {
+          validOffsets.push(scanOffset)
+        }
+        scanOffset += structLen
+      } else {
+        scanOffset += 1
+        while (scanOffset + structLen <= buffer.byteLength) {
+          if (isValidRecordHeader(view, scanOffset, buffer.byteLength)) break
+          scanOffset += 1
+        }
+      }
+    }
     
-    while (offset + structLen <= buffer.byteLength) {
-      const t = parseFloat((view.getUint32(offset, true) / 1000).toFixed(1))
+    if (validOffsets.length === 0) {
+      alert("File binary kosong atau tidak ditemukan data telemetri valid!")
+      event.target.value = ''
+      return
+    }
+
+    // Batasi titik rendering ~400-500 poin agar UI sangat cepat dan tidak hang/unresponsive
+    const step = Math.max(1, Math.floor(validOffsets.length / 400))
+    
+    for (let i = 0; i < validOffsets.length; i += step) {
+      const offset = validOffsets[i]
+      const rawTs = view.getUint32(offset, true)
+      const t = parseFloat((rawTs / 1000).toFixed(2))
       tempTime.push(t)
       tempAx.push([t, view.getFloat32(offset + 12, true)])
       tempAy.push([t, view.getFloat32(offset + 16, true)])
@@ -688,19 +811,50 @@ const handleFileUpload = async (event) => {
       tempLat.push(lat)
       tempLon.push(lon)
       
-      let speed = 0;
-      if (prevLat && prevLon && prevT && lat !== 0 && lon !== 0) {
-        const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, lat, lon);
-        if (t - prevT > 0) speed = (distKm / (t - prevT)) * 3600;
-      }
-      if (lat !== 0 && lon !== 0) { prevLat = lat; prevLon = lon; prevT = t; }
-      tempSpeed.push([t, speed])
-      
       tempGAlt.push([t, view.getFloat32(offset + 48, true)])
       tempPdop.push([t, view.getFloat32(offset + 52, true)])
       tempSats.push([t, view.getUint8(offset + 57)])
-      
-      offset += structLen * step
+
+      if (is90Byte) {
+        const sl = view.getFloat32(offset + 58, true)
+        const sr = view.getFloat32(offset + 62, true)
+        const vbus = view.getFloat32(offset + 66, true)
+        const iq = view.getFloat32(offset + 70, true)
+        let r1 = view.getFloat32(offset + 74, true)
+        let r2 = view.getFloat32(offset + 78, true)
+        const t1 = view.getFloat32(offset + 82, true)
+        const t2 = view.getFloat32(offset + 86, true)
+
+        // Hitung fallback Wheel RPM jika data tersimpan bernilai 0 tapi roda berputar
+        const circM = (Math.PI * 500) / 1000
+        if (r1 <= 0 && sr > 0) r1 = Math.round((sr * 1000) / (circM * 60))
+        if (r2 <= 0 && sl > 0) r2 = Math.round((sl * 1000) / (circM * 60))
+
+        const spd = Number((((sl || 0) + (sr || 0)) / 2).toFixed(1))
+        tempSpeed.push([t, spd])
+        tempVbus.push([t, vbus])
+        tempIq.push([t, iq])
+        tempR1.push([t, r1])
+        tempR2.push([t, r2])
+        tempT1.push([t, t1])
+        tempT2.push([t, t2])
+      } else {
+        // Mode 58-byte: Isi semua array agar ApexCharts grup tersinkronisasi tidak crash/hang
+        let speed = 0;
+        if (prevLat && prevLon && prevT && lat !== 0 && lon !== 0) {
+          const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, lat, lon);
+          if (t - prevT > 0) speed = (distKm / (t - prevT)) * 3600;
+        }
+        if (lat !== 0 && lon !== 0) { prevLat = lat; prevLon = lon; prevT = t; }
+        tempSpeed.push([t, Number(speed.toFixed(1))])
+
+        tempVbus.push([t, 0])
+        tempIq.push([t, 0])
+        tempR1.push([t, 0])
+        tempR2.push([t, 0])
+        tempT1.push([t, 0])
+        tempT2.push([t, 0])
+      }
     }
   } else if (file.name.endsWith('.csv')) {
     const text = await file.text()
@@ -727,6 +881,9 @@ const handleFileUpload = async (event) => {
     let idxIq = headerCols.findIndex(c => c.includes('iq') || c.includes('current'))
     let idxR1 = headerCols.findIndex(c => c.includes('tim2') || c.includes('rpm1') || c.includes('r1'))
     let idxR2 = headerCols.findIndex(c => c.includes('tim5') || c.includes('rpm2') || c.includes('r2'))
+    let idxSr = headerCols.findIndex(c => c.includes('speedright') || c.includes('sr'))
+    let idxSl = headerCols.findIndex(c => c.includes('speedleft') || c.includes('sl'))
+    let idxSpd = headerCols.findIndex(c => c.includes('speedavg') || c.includes('speed') && !c.includes('left') && !c.includes('right'))
     let idxT1 = headerCols.findIndex(c => c.includes('temp1') || c.includes('t1') || c.includes('suhu1'))
     let idxT2 = headerCols.findIndex(c => c.includes('temp2') || c.includes('t2') || c.includes('suhu2'))
 
@@ -754,23 +911,37 @@ const handleFileUpload = async (event) => {
       tempLon.push(lon)
       
       let speed = 0;
-      if (prevLat && prevLon && prevT && lat !== 0 && lon !== 0) {
+      if (idxSpd >= 0) {
+        speed = parseFloat(cols[idxSpd]) || 0
+      } else if (idxSl >= 0 || idxSr >= 0) {
+        const slVal = idxSl >= 0 ? parseFloat(cols[idxSl]) || 0 : 0
+        const srVal = idxSr >= 0 ? parseFloat(cols[idxSr]) || 0 : 0
+        speed = (slVal + srVal) / 2
+      } else if (prevLat && prevLon && prevT && lat !== 0 && lon !== 0) {
         const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, lat, lon);
         if (t - prevT > 0) speed = (distKm / (t - prevT)) * 3600;
       }
       if (lat !== 0 && lon !== 0) { prevLat = lat; prevLon = lon; prevT = t; }
-      tempSpeed.push([t, speed])
+      tempSpeed.push([t, Number(speed.toFixed(1))])
       
       if (idxGAlt >= 0) tempGAlt.push([t, parseFloat(cols[idxGAlt]) || 0])
       if (idxPdop >= 0) tempPdop.push([t, parseFloat(cols[idxPdop]) || 0])
       if (idxSats >= 0) tempSats.push([t, parseFloat(cols[idxSats]) || 0])
 
-      if (idxVbus >= 0) tempVbus.push([t, parseFloat(cols[idxVbus]) || 0])
-      if (idxIq >= 0) tempIq.push([t, parseFloat(cols[idxIq]) || 0])
-      if (idxR1 >= 0) tempR1.push([t, parseFloat(cols[idxR1]) || 0])
-      if (idxR2 >= 0) tempR2.push([t, parseFloat(cols[idxR2]) || 0])
-      if (idxT1 >= 0) tempT1.push([t, parseFloat(cols[idxT1]) || 0])
-      if (idxT2 >= 0) tempT2.push([t, parseFloat(cols[idxT2]) || 0])
+      tempVbus.push([t, idxVbus >= 0 ? parseFloat(cols[idxVbus]) || 0 : 0])
+      tempIq.push([t, idxIq >= 0 ? parseFloat(cols[idxIq]) || 0 : 0])
+
+      let r1Val = idxR1 >= 0 ? parseFloat(cols[idxR1]) || 0 : 0
+      let r2Val = idxR2 >= 0 ? parseFloat(cols[idxR2]) || 0 : 0
+      const srVal = idxSr >= 0 ? parseFloat(cols[idxSr]) || 0 : 0
+      const slVal = idxSl >= 0 ? parseFloat(cols[idxSl]) || 0 : 0
+      if (r1Val <= 0 && srVal > 0) r1Val = Math.round((srVal * 1000) / (((Math.PI * 500) / 1000) * 60))
+      if (r2Val <= 0 && slVal > 0) r2Val = Math.round((slVal * 1000) / (((Math.PI * 500) / 1000) * 60))
+      tempR1.push([t, r1Val])
+      tempR2.push([t, r2Val])
+
+      tempT1.push([t, idxT1 >= 0 ? parseFloat(cols[idxT1]) || 0 : 0])
+      tempT2.push([t, idxT2 >= 0 ? parseFloat(cols[idxT2]) || 0 : 0])
     }
   }
 
@@ -819,7 +990,12 @@ const updateMapPath = (lats, lons) => {
   if (endMarker) mapInstance.removeLayer(endMarker)
   startMarker = L.marker(validLatLngs[0], {icon: greenIcon}).bindPopup("Start").addTo(mapInstance)
   endMarker = L.marker(validLatLngs[validLatLngs.length - 1], {icon: redIcon}).bindPopup("End").addTo(mapInstance)
-  mapInstance.fitBounds(polyline.getBounds(), { padding: [20, 20] })
+  
+  if (validLatLngs.length > 1) {
+    mapInstance.fitBounds(polyline.getBounds(), { padding: [20, 20] })
+  } else if (validLatLngs.length === 1) {
+    mapInstance.setView(validLatLngs[0], 16)
+  }
 }
 
 const initMap = () => {
@@ -849,24 +1025,45 @@ onMounted(() => {
       if (connectionTimeout) clearTimeout(connectionTimeout)
       connectionTimeout = setTimeout(() => {
         isConnected.value = false
-      }, 3000)
+      }, 6000)
 
       const MAX_PTS = 120 
-      const t = data.ts ? (data.ts / 1000) : (Date.now() / 1000)
+
+      // Validasi timestamp agar tidak melonjak ke epoch miliaran detik atau mundur saat MCU reset
+      let t = (data.ts !== undefined && data.ts !== null && !isNaN(data.ts))
+        ? Number((data.ts / 1000).toFixed(2))
+        : Number((Date.now() / 1000).toFixed(2))
+
+      // Deteksi jika STM32 restart (waktu t mundur drastis > 3 detik dari waktu sebelumnya)
+      if (timeHistory.value.length > 0) {
+        const lastT = timeHistory.value[timeHistory.value.length - 1]
+        if (t < lastT - 3.0) {
+          clearData()
+        } else if (t <= lastT) {
+          t = Number((lastT + 0.05).toFixed(2))
+        }
+      }
+
+      // Kalkulasi kecepatan kendaraan: prioritaskan kecepatan roda (sl & sr) dari sensor STM32
       let speed = 0
-      if (liveLats.value.length > 0 && liveLons.value.length > 0 && timeHistory.value.length > 0) {
-         let lastValidIdx = liveLats.value.length - 1
-         while (lastValidIdx >= 0 && (liveLats.value[lastValidIdx] === 0 || !liveLats.value[lastValidIdx])) {
-           lastValidIdx--
-         }
-         if (lastValidIdx >= 0 && data.lat && data.lon && data.lat !== 0 && data.lon !== 0) {
-           const prevLat = liveLats.value[lastValidIdx]
-           const prevLon = liveLons.value[lastValidIdx]
-           const prevT = timeHistory.value[lastValidIdx]
-           const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, data.lat, data.lon)
-           const dtSec = t - prevT
-           if (dtSec > 0) speed = (distKm / dtSec) * 3600
-         }
+      const sl = (data.sl !== undefined && data.sl !== null) ? Number(data.sl) : null
+      const sr = (data.sr !== undefined && data.sr !== null) ? Number(data.sr) : null
+
+      if (sl !== null || sr !== null) {
+        speed = Number((((sl || 0) + (sr || 0)) / ((sl !== null && sr !== null) ? 2 : 1)).toFixed(1))
+      } else if (liveLats.value.length > 0 && liveLons.value.length > 0 && timeHistory.value.length > 0) {
+        let lastValidIdx = liveLats.value.length - 1
+        while (lastValidIdx >= 0 && (liveLats.value[lastValidIdx] === 0 || !liveLats.value[lastValidIdx])) {
+          lastValidIdx--
+        }
+        if (lastValidIdx >= 0 && data.lat && data.lon && data.lat !== 0 && data.lon !== 0) {
+          const prevLat = liveLats.value[lastValidIdx]
+          const prevLon = liveLons.value[lastValidIdx]
+          const prevT = timeHistory.value[lastValidIdx]
+          const distKm = getDistanceFromLatLonInKm(prevLat, prevLon, data.lat, data.lon)
+          const dtSec = t - prevT
+          if (dtSec > 0) speed = Number(((distKm / dtSec) * 3600).toFixed(1))
+        }
       }
 
       timeHistory.value = [...timeHistory.value, t].slice(-MAX_PTS)
@@ -884,13 +1081,35 @@ onMounted(() => {
       liveLats.value = [...liveLats.value, data.lat || 0].slice(-MAX_PTS)
       liveLons.value = [...liveLons.value, data.lon || 0].slice(-MAX_PTS)
 
-      // Parameter telemetri baru
-      const vb = (data.vbus !== undefined) ? data.vbus : (data.vb || 0)
-      const iq = (data.iq !== undefined) ? data.iq : 0
-      const r1 = (data.r1 !== undefined) ? data.r1 : (data.rpm1 || 0)
-      const r2 = (data.r2 !== undefined) ? data.r2 : (data.rpm2 || 0)
-      const t1 = (data.t1 !== undefined) ? data.t1 : (data.temp1 || 0)
-      const t2 = (data.t2 !== undefined) ? data.t2 : (data.temp2 || 0)
+      // Parameter telemetri motor & suhu
+      const vb = (data.vbus !== undefined) ? Number(data.vbus) : (data.vb ? Number(data.vb) : 0)
+      const iq = (data.iq !== undefined) ? Number(data.iq) : 0
+
+      // Wheel RPM: TIM2 Right Wheel (sr) vs TIM5 Left Wheel (sl)
+      // Diameter roda Kukang EV = 500mm -> Keliling roda = PI * 500mm = ~1.5708 meter
+      const WHEEL_DIAMETER_MM = 500
+      const CIRCUMFERENCE_M = (Math.PI * WHEEL_DIAMETER_MM) / 1000
+
+      let r1 = (data.r1 !== undefined && data.r1 !== null) ? Number(data.r1) : (data.rpm1 ? Number(data.rpm1) : 0)
+      let r2 = (data.r2 !== undefined && data.r2 !== null) ? Number(data.r2) : (data.rpm2 ? Number(data.rpm2) : 0)
+
+      // Sinkronisasi otomatis: Jika r1 atau r2 di database bernilai 0 / belum diset,
+      // kalkulasikan RPM roda secara langsung dari sensor kecepatan roda (sr & sl)
+      if (r1 <= 0 && sr !== null && sr > 0) {
+        r1 = Number(((sr * 1000) / (CIRCUMFERENCE_M * 60)).toFixed(0))
+      }
+      if (r2 <= 0 && sl !== null && sl > 0) {
+        r2 = Number(((sl * 1000) / (CIRCUMFERENCE_M * 60)).toFixed(0))
+      }
+
+      // Sensor suhu: Suhu 1 (t1) & Suhu 2 (t2)
+      let t1 = (data.t1 !== undefined && data.t1 !== null) ? Number(data.t1) : (data.temp1 ? Number(data.temp1) : 0)
+      let t2 = (data.t2 !== undefined && data.t2 !== null) ? Number(data.t2) : (data.temp2 ? Number(data.temp2) : 0)
+      if (t2 <= 0 && t1 > 0) {
+        t2 = t1
+      } else if (t1 <= 0 && t2 > 0) {
+        t1 = t2
+      }
 
       vbusHistory.value = [...vbusHistory.value, [t, vb]].slice(-MAX_PTS)
       iqHistory.value = [...iqHistory.value, [t, iq]].slice(-MAX_PTS)
@@ -904,10 +1123,12 @@ onMounted(() => {
       if (isRecording.value) {
         recordedData.value.push({
           time: Date.now(),
+          ts: data.ts || 0,
           ax: data.ax || 0, ay: data.ay || 0, az: data.az || 0,
           gx: data.gx || 0, gy: data.gy || 0, gz: data.gz || 0,
           alt: data.alt || 0, lat: data.lat || 0, lon: data.lon || 0,
           galt: data.galt || 0, pd: data.pd || 0, ns: data.ns || 0,
+          sl: sl !== null ? sl : 0, sr: sr !== null ? sr : 0, speed: speed,
           vbus: vb, iq: iq, r1: r1, r2: r2, t1: t1, t2: t2
         })
       }

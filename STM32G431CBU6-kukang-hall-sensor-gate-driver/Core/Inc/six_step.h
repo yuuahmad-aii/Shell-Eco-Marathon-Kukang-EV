@@ -24,4 +24,8 @@ void SixStep_PrintDebug(void);
 // FOC support
 float SixStep_GetElectricalAngle(void);
 
+// Hall Sensor helpers & Calibration
+uint8_t SixStep_GetHallState(void);
+void SixStep_CalibrateHall(float cal_voltage);
+
 #endif // SIX_STEP_H

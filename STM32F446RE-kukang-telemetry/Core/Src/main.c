@@ -42,7 +42,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define M_PI 3.14
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -305,6 +305,14 @@ int main(void) {
     float pdop;
     uint8_t fix_type;
     uint8_t num_satellites;
+    float speed_left;
+    float speed_right;
+    float vbus;
+    float iq;
+    float rpm_right;
+    float rpm_left;
+    float temp1;
+    float temp2;
   } LogData;
 #pragma pack(pop)
 
@@ -314,6 +322,7 @@ int main(void) {
 
   uint32_t last_ui_tick = 0;
   uint32_t last_log_tick = 0;
+  uint32_t last_sync_tick = 0;
 
   char current_filename[16] = {0};
 
@@ -321,6 +330,16 @@ int main(void) {
     CLI_Task();
 
     uint32_t current_tick = HAL_GetTick();
+
+    // --- DS18B20 Periodic Search Retry (if < 2 sensors detected) ---
+    static uint32_t last_ds18b20_search = 0;
+    if (num_ds18b20 < 2 && current_tick - last_ds18b20_search >= 3000) {
+      last_ds18b20_search = current_tick;
+      uint8_t found = DS18B20_Search(GPIOB, GPIO_PIN_10, ds18b20_devs, 2);
+      if (found > num_ds18b20) {
+        num_ds18b20 = found;
+      }
+    }
 
     // --- DS18B20 Async State Machine ---
     if (num_ds18b20 > 0) {
@@ -346,6 +365,32 @@ int main(void) {
           (uint32_t)current_config.log_interval_ms) {
         last_log_tick = current_tick;
 
+        // Calculate Wheel RPM & Temperature with robust fallbacks
+        float log_r1 = rpm_tim2ch1;
+        float log_r2 = rpm_tim5ch2;
+        if (log_r1 <= 0.0f && speed_right_kmh > 0.0f && current_config.wheel_diameter_mm > 0.0f) {
+          log_r1 = (speed_right_kmh * 1000000.0f) / (M_PI * current_config.wheel_diameter_mm * 60.0f);
+        }
+        if (log_r2 <= 0.0f && speed_left_kmh > 0.0f && current_config.wheel_diameter_mm > 0.0f) {
+          log_r2 = (speed_left_kmh * 1000000.0f) / (M_PI * current_config.wheel_diameter_mm * 60.0f);
+        }
+
+        float log_t1 = 0.0f;
+        float log_t2 = 0.0f;
+        if (num_ds18b20 >= 2) {
+          log_t1 = (ds18b20_devs[0].temperature > -50.0f && ds18b20_devs[0].temperature < 125.0f && ds18b20_devs[0].temperature != 0.0f)
+                  ? ds18b20_devs[0].temperature : bmp_data.temperature;
+          log_t2 = (ds18b20_devs[1].temperature > -50.0f && ds18b20_devs[1].temperature < 125.0f && ds18b20_devs[1].temperature != 0.0f)
+                  ? ds18b20_devs[1].temperature : bmp_data.temperature;
+        } else if (num_ds18b20 == 1) {
+          log_t1 = (ds18b20_devs[0].temperature > -50.0f && ds18b20_devs[0].temperature < 125.0f && ds18b20_devs[0].temperature != 0.0f)
+                  ? ds18b20_devs[0].temperature : bmp_data.temperature;
+          log_t2 = bmp_data.temperature;
+        } else {
+          log_t1 = bmp_data.temperature;
+          log_t2 = bmp_data.temperature;
+        }
+
         LogData log_entry;
         log_entry.timestamp_ms = current_tick - log_start_time;
         log_entry.year = gps_data.year;
@@ -370,11 +415,21 @@ int main(void) {
         log_entry.fix_type = gps_data.fix_type;
         log_entry.num_satellites = gps_data.num_satellites;
 
+        log_entry.speed_left = speed_left_kmh;
+        log_entry.speed_right = speed_right_kmh;
+        log_entry.vbus = can_vbus;
+        log_entry.iq = can_actual_iq;
+        log_entry.rpm_right = log_r1;
+        log_entry.rpm_left = log_r2;
+        log_entry.temp1 = log_t1;
+        log_entry.temp2 = log_t2;
+
         UINT bytes_written = 0;
         FRESULT w_res =
             f_write(&SDFile, &log_entry, sizeof(LogData), &bytes_written);
-        if (w_res != FR_OK || bytes_written == 0) {
-          CLI_Print("Log err: write %d. Recovering SD...\r\n", w_res);
+        if (w_res != FR_OK || bytes_written < sizeof(LogData)) {
+          CLI_Print("Log err: write %d (wrote %u/%u). Recovering SD...\r\n",
+                    w_res, bytes_written, (uint32_t)sizeof(LogData));
           sd_error = 1;
 
           // Auto Recovery Mechanism
@@ -384,7 +439,14 @@ int main(void) {
           if (f_mount(&SDFatFS, SDPath, 1) == FR_OK) {
             if (f_open(&SDFile, current_filename, FA_OPEN_APPEND | FA_WRITE) ==
                 FR_OK) {
-              CLI_Print("SD Recovered!\r\n");
+              // Enforce alignment to sizeof(LogData) so fptr never shifts off record boundaries
+              FSIZE_t cur_sz = f_size(&SDFile);
+              FSIZE_t aligned_sz = (cur_sz / sizeof(LogData)) * sizeof(LogData);
+              if (cur_sz != aligned_sz) {
+                f_lseek(&SDFile, aligned_sz);
+              }
+              last_sync_tick = HAL_GetTick();
+              CLI_Print("SD Recovered (Aligned to %lu)!\r\n", (uint32_t)aligned_sz);
               sd_error = 0;
             } else {
               is_logging = 0; // Fatal error, stop logging
@@ -396,10 +458,8 @@ int main(void) {
           }
         }
 
-        // We only sync once per second to ensure data is saved without
-        // stalling.
-        static uint32_t last_sync_tick = 0;
-        if (is_logging && (current_tick - last_sync_tick >= 1000)) {
+        // Periodic sync every 2000 ms to avoid microSD flash wear latency
+        if (is_logging && (current_tick - last_sync_tick >= 2000)) {
           FRESULT s_res = f_sync(&SDFile);
           if (s_res != FR_OK) {
             CLI_Print("Log err: sync %d. Recovering SD...\r\n", s_res);
@@ -410,7 +470,13 @@ int main(void) {
             if (f_mount(&SDFatFS, SDPath, 1) == FR_OK) {
               if (f_open(&SDFile, current_filename,
                          FA_OPEN_APPEND | FA_WRITE) == FR_OK) {
-                CLI_Print("SD Recovered!\r\n");
+                FSIZE_t cur_sz = f_size(&SDFile);
+                FSIZE_t aligned_sz = (cur_sz / sizeof(LogData)) * sizeof(LogData);
+                if (cur_sz != aligned_sz) {
+                  f_lseek(&SDFile, aligned_sz);
+                }
+                last_sync_tick = HAL_GetTick();
+                CLI_Print("SD Recovered (Aligned to %lu)!\r\n", (uint32_t)aligned_sz);
                 sd_error = 0;
               } else {
                 is_logging = 0;
@@ -535,6 +601,7 @@ int main(void) {
         last_btn_action_tick[4] = current_tick;
         if (is_logging || sd_error) {
           f_close(&SDFile);
+          f_mount(NULL, SDPath, 1);
           is_logging = 0;
           sd_error = 0;
           CLI_Print("Log stopped / Err cleared\r\n");
@@ -551,6 +618,7 @@ int main(void) {
                 sd_error = 0;
                 log_start_time = HAL_GetTick();
                 last_log_tick = log_start_time; // Reset log tick
+                last_sync_tick = log_start_time; // Reset sync tick to prevent premature sync
 
                 // Reset distance and energy baseline at start line
                 accumulated_distance_km = 0.0f;
@@ -743,14 +811,38 @@ int main(void) {
     if (current_tick - last_telemetry_tick >= 500) {
       last_telemetry_tick = current_tick;
 
-      float temp1 = (num_ds18b20 > 0) ? ds18b20_devs[0].temperature : 0.0f;
-      float temp2 = (num_ds18b20 > 1) ? ds18b20_devs[1].temperature : 0.0f;
+      // Temperature fallback: prioritize DS18B20; fallback to BMP280 temperature if DS18B20 is unavailable or invalid
+      float temp1 = 0.0f;
+      float temp2 = 0.0f;
+      if (num_ds18b20 >= 2) {
+        temp1 = (ds18b20_devs[0].temperature > -50.0f && ds18b20_devs[0].temperature < 125.0f && ds18b20_devs[0].temperature != 0.0f)
+                ? ds18b20_devs[0].temperature : bmp_data.temperature;
+        temp2 = (ds18b20_devs[1].temperature > -50.0f && ds18b20_devs[1].temperature < 125.0f && ds18b20_devs[1].temperature != 0.0f)
+                ? ds18b20_devs[1].temperature : bmp_data.temperature;
+      } else if (num_ds18b20 == 1) {
+        temp1 = (ds18b20_devs[0].temperature > -50.0f && ds18b20_devs[0].temperature < 125.0f && ds18b20_devs[0].temperature != 0.0f)
+                ? ds18b20_devs[0].temperature : bmp_data.temperature;
+        temp2 = bmp_data.temperature;
+      } else {
+        temp1 = bmp_data.temperature;
+        temp2 = bmp_data.temperature;
+      }
+
+      // Wheel RPM fallback: TIM2 is Right Wheel, TIM5 is Left Wheel.
+      // If RPM is 0 while wheel speed is non-zero, calculate RPM directly from speed to prevent zero RPM in telemetry
+      float r1 = rpm_tim2ch1;
+      float r2 = rpm_tim5ch2;
+      if (r1 <= 0.0f && speed_right_kmh > 0.0f && current_config.wheel_diameter_mm > 0.0f) {
+        r1 = (speed_right_kmh * 1000000.0f) / (M_PI * current_config.wheel_diameter_mm * 60.0f);
+      }
+      if (r2 <= 0.0f && speed_left_kmh > 0.0f && current_config.wheel_diameter_mm > 0.0f) {
+        r2 = (speed_left_kmh * 1000000.0f) / (M_PI * current_config.wheel_diameter_mm * 60.0f);
+      }
 
       static char tele_buf[512];
       int len = snprintf(
           tele_buf, sizeof(tele_buf),
-          "{\"ts\":%lu,\"y\":%u,\"m\":%u,\"d\":%u,\"h\":%u,\"min\":%u,\"s\":%"
-          "u,"
+          "{\"ts\":%lu,\"y\":%u,\"m\":%u,\"d\":%u,\"h\":%u,\"min\":%u,\"s\":%u,"
           "\"v\":%u,"
           "\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,"
           "\"gx\":%.1f,\"gy\":%.1f,\"gz\":%.1f,"
@@ -761,16 +853,35 @@ int main(void) {
           "\"vbus\":%.2f,\"iq\":%.2f,"
           "\"r1\":%.0f,\"r2\":%.0f,"
           "\"t1\":%.2f,\"t2\":%.2f}\n",
-          current_tick, gps_data.year, gps_data.month, gps_data.day,
-          gps_data.hour, gps_data.min, gps_data.sec, gps_data.is_time_valid,
-          imu_data.accel_x, imu_data.accel_y, imu_data.accel_z, imu_data.gyro_x,
-          imu_data.gyro_y, imu_data.gyro_z, bmp_data.altitude,
-          gps_data.latitude, gps_data.longitude, gps_data.gps_altitude,
-          gps_data.pdop, gps_data.fix_type, gps_data.num_satellites,
-          speed_left_kmh, speed_right_kmh,
-          can_vbus, can_actual_iq,
-          rpm_tim2ch1, rpm_tim5ch2,
-          temp1, temp2);
+          (unsigned long)current_tick,
+          (unsigned int)gps_data.year,
+          (unsigned int)gps_data.month,
+          (unsigned int)gps_data.day,
+          (unsigned int)gps_data.hour,
+          (unsigned int)gps_data.min,
+          (unsigned int)gps_data.sec,
+          (unsigned int)gps_data.is_time_valid,
+          (double)imu_data.accel_x,
+          (double)imu_data.accel_y,
+          (double)imu_data.accel_z,
+          (double)imu_data.gyro_x,
+          (double)imu_data.gyro_y,
+          (double)imu_data.gyro_z,
+          (double)bmp_data.altitude,
+          (double)gps_data.latitude,
+          (double)gps_data.longitude,
+          (double)gps_data.gps_altitude,
+          (double)gps_data.pdop,
+          (unsigned int)gps_data.fix_type,
+          (unsigned int)gps_data.num_satellites,
+          (double)speed_left_kmh,
+          (double)speed_right_kmh,
+          (double)can_vbus,
+          (double)can_actual_iq,
+          (double)r1,
+          (double)r2,
+          (double)temp1,
+          (double)temp2);
 
       if (len > 0 && len < sizeof(tele_buf)) {
         // Use IT (Interrupt) to prevent blocking the main loop

@@ -256,10 +256,11 @@ void Config_PrintHelp(void) {
   cdc_printf("$$      : Show all settings\r\n");
   cdc_printf("$x=y    : Set parameter x to value y\r\n");
   cdc_printf("$save   : Save settings to flash\r\n");
+  cdc_printf("$cal    : Auto-Calibrate Hall Offset Deg (Optional: $cal=<volt>)\r\n");
   cdc_printf("$?      : Show Hall & MOSFET states\r\n");
   cdc_printf("$can    : Show FDCAN1 Bus Diagnostics\r\n");
   cdc_printf("$h      : Show this help\r\n");
-  cdc_printf("S<val>  : Set Target Duty Cycle (%)\r\n");
+  cdc_printf("S<val>  : Set Target Duty Cycle (%%)\r\n");
   cdc_printf("T       : Stop Motor\r\n");
   cdc_printf("C       : Show FDCAN1 Bus Diagnostics\r\n");
   cdc_printf("ok\r\n");
@@ -271,6 +272,12 @@ void Config_ParseCommand(char *cmd_line) {
       Config_PrintAll();
     } else if (strncmp(&cmd_line[1], "save", 4) == 0) {
       Config_Save();
+    } else if (strncmp(&cmd_line[1], "cal", 3) == 0 || strncmp(&cmd_line[1], "CAL", 3) == 0) {
+      float cal_volt = 0.0f;
+      if (cmd_line[4] == '=') {
+        cal_volt = (float)atof(&cmd_line[5]);
+      }
+      SixStep_CalibrateHall(cal_volt);
     } else if (cmd_line[1] == '?') {
       extern void SixStep_PrintDebug(void);
       SixStep_PrintDebug();

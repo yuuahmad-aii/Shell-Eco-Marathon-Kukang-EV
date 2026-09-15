@@ -147,4 +147,57 @@ body {
   display: flex;
   flex-direction: column;
 }
+
+/* Mobile & Tablet Responsive (Satu Kolom Banyak Baris) */
+@media (max-width: 900px) {
+  body {
+    overflow-y: auto !important;
+    height: auto !important;
+  }
+  .dashboard-container {
+    height: auto !important;
+    min-height: 100vh;
+    padding: 8px;
+    gap: 10px;
+    overflow-y: visible !important;
+  }
+  .header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+  .logo h1 {
+    font-size: 1.1rem;
+    white-space: nowrap;
+  }
+  .logo span {
+    font-size: 0.8rem;
+  }
+  .header-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    width: 100%;
+  }
+  .file-upload-btn {
+    padding: 6px 10px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .status {
+    padding: 4px 8px;
+    font-size: 0.75rem;
+    white-space: nowrap;
+  }
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+    display: flex;
+    flex-direction: column;
+    height: auto;
+    min-height: auto;
+    overflow: visible;
+  }
+}
 </style>

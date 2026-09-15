@@ -37,15 +37,61 @@
     </Teleport>
 
     <!-- MOTOR TELEMETRY -->
-    <main class="dashboard-grid" style="grid-template-columns: 1fr; overflow-y: auto;">
-      <div class="charts-column" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-        <!-- Q1: Target vs Actual Iq -->
-        <div class="chart-card" style="display:flex; flex-direction:row; gap:10px; align-items:center;">
+    <main class="dashboard-grid motor-dashboard-layout">
+      <!-- Sisi Kiri: Serial Terminal Card (Full-Height) -->
+      <div class="chart-card motor-terminal-card">
+        <div class="terminal-card-header">
+          <div class="chart-title" style="margin-bottom: 0; display: flex; align-items: center; gap: 8px;">
+            <span>📟 Motor Serial Terminal</span>
+          </div>
+          <div class="connection-pill" :class="isSerialConnected ? 'connected' : 'offline'">
+            <span class="status-dot"></span>
+            <span>{{ isSerialConnected ? 'USB Active' : (isOfflineMode ? 'Log Mode' : 'Disconnected') }}</span>
+          </div>
+        </div>
+
+        <!-- Quick CLI Action Buttons -->
+        <div class="quick-cli-container">
+          <button class="quick-cli-btn" @click="sendQuickCli('$$')" title="Tampilkan Semua Parameter GRBL ($0-$16)">$$ (Config)</button>
+          <button class="quick-cli-btn" @click="sendQuickCli('$?')" title="Tampilkan Live Status & Debug">$? (Status)</button>
+          <button class="quick-cli-btn" @click="sendQuickCli('$can')" title="Tampilkan Status FDCAN Bus">$can (CAN)</button>
+          <button class="quick-cli-btn" @click="sendQuickCli('$cal')" title="Kalibrasi Hall Sensor Offset">$cal (Calibrate)</button>
+          <button class="quick-cli-btn" @click="sendQuickCli('$save')" title="Simpan Parameter ke Flash">$save (Save)</button>
+          <button class="quick-cli-btn stop-btn" @click="sendQuickCli('s0')" title="Emergency / Stop Motor (0 RPM)">s0 (Stop)</button>
+        </div>
+
+        <!-- Terminal Output -->
+        <textarea 
+          readonly 
+          class="terminal-output" 
+          ref="terminalOutput" 
+          :value="terminalText" 
+          placeholder="Terminal output & telemetry logs will appear here..."
+        ></textarea>
+
+        <!-- Command Input Row -->
+        <div class="terminal-input-bar">
+          <input 
+            type="text" 
+            v-model="cmdInput" 
+            @keyup.enter="sendSerialCommand" 
+            class="terminal-input-field"
+            placeholder="Type command (e.g. $$, $10=6.06, s300, $save)..."
+          >
+          <button class="file-upload-btn send-btn" @click="sendSerialCommand">Send</button>
+          <button class="file-upload-btn clear-btn" @click="terminalText = ''">Clear</button>
+        </div>
+      </div>
+
+      <!-- Sisi Kanan: 4 Grafik Motor Tersusun 2 Kolom x 2 Baris -->
+      <div class="motor-charts-grid">
+        <!-- Q1: Target vs Actual Iq (Baris 1, Kolom 1) -->
+        <div class="chart-card chart-cell">
           <div style="flex:1; min-width:0;">
             <div class="chart-title">Target vs Actual Iq (A)</div>
-            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="280" :options="motorIqOptions" :series="motorIqSeries"></apexchart>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="230" :options="motorIqOptions" :series="motorIqSeries"></apexchart>
           </div>
-          <div style="width:90px; display:flex; flex-direction:column; gap:5px; font-size:11px; color:#94a3b8;">
+          <div class="axis-panel">
              <label>Y Max <input type="number" v-model.lazy="iqYMax" class="axis-input"></label>
              <label>Y Min <input type="number" v-model.lazy="iqYMin" class="axis-input"></label>
              <label v-if="!isOfflineMode">X Max (s) <input type="number" v-model.lazy="iqXMax" class="axis-input"></label>
@@ -53,13 +99,13 @@
           </div>
         </div>
 
-        <!-- NEW: DC Bus Voltage -->
-        <div class="chart-card" style="display:flex; flex-direction:row; gap:10px; align-items:center;">
+        <!-- Q2: DC Bus Voltage (Baris 1, Kolom 2) -->
+        <div class="chart-card chart-cell">
           <div style="flex:1; min-width:0;">
             <div class="chart-title">DC Bus Voltage (V)</div>
-            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="280" :options="motorVbusOptions" :series="motorVbusSeries"></apexchart>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="230" :options="motorVbusOptions" :series="motorVbusSeries"></apexchart>
           </div>
-          <div style="width:90px; display:flex; flex-direction:column; gap:5px; font-size:11px; color:#94a3b8;">
+          <div class="axis-panel">
              <label>Y Max <input type="number" v-model.lazy="vbusYMax" class="axis-input"></label>
              <label>Y Min <input type="number" v-model.lazy="vbusYMin" class="axis-input"></label>
              <label v-if="!isOfflineMode">X Max (s) <input type="number" v-model.lazy="vbusXMax" class="axis-input"></label>
@@ -67,13 +113,13 @@
           </div>
         </div>
 
-        <!-- Q2: Velocity -->
-        <div class="chart-card" style="display:flex; flex-direction:row; gap:10px; align-items:center;">
+        <!-- Q3: Electrical Velocity (Baris 2, Kolom 1) -->
+        <div class="chart-card chart-cell">
           <div style="flex:1; min-width:0;">
             <div class="chart-title">Electrical Velocity (RPM)</div>
-            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="280" :options="motorVelOptions" :series="motorVelSeries"></apexchart>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="230" :options="motorVelOptions" :series="motorVelSeries"></apexchart>
           </div>
-          <div style="width:90px; display:flex; flex-direction:column; gap:5px; font-size:11px; color:#94a3b8;">
+          <div class="axis-panel">
              <label>Y Max <input type="number" v-model.lazy="velYMax" class="axis-input"></label>
              <label>Y Min <input type="number" v-model.lazy="velYMin" class="axis-input"></label>
              <label v-if="!isOfflineMode">X Max (s) <input type="number" v-model.lazy="velXMax" class="axis-input"></label>
@@ -81,28 +127,17 @@
           </div>
         </div>
 
-        <!-- Q3: Phase Current -->
-        <div class="chart-card" style="display:flex; flex-direction:row; gap:10px; align-items:center;">
+        <!-- Q4: Phase Current (Baris 2, Kolom 2) -->
+        <div class="chart-card chart-cell">
           <div style="flex:1; min-width:0;">
             <div class="chart-title">Phase Current (U, V, W Amperes)</div>
-            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="280" :options="motorPhaseOptions" :series="motorPhaseSeries"></apexchart>
+            <apexchart :key="isOfflineMode ? ('offline-' + offlineSessionKey) : 'live'" type="line" height="230" :options="motorPhaseOptions" :series="motorPhaseSeries"></apexchart>
           </div>
-          <div style="width:90px; display:flex; flex-direction:column; gap:5px; font-size:11px; color:#94a3b8;">
+          <div class="axis-panel">
              <label>Y Max <input type="number" v-model.lazy="phaseYMax" class="axis-input"></label>
              <label>Y Min <input type="number" v-model.lazy="phaseYMin" class="axis-input"></label>
              <label v-if="!isOfflineMode">X Max (s) <input type="number" v-model.lazy="phaseXMax" class="axis-input"></label>
              <label v-if="!isOfflineMode">X Min (s) <input type="number" v-model.lazy="phaseXMin" class="axis-input"></label>
-          </div>
-        </div>
-        
-        <!-- Q4: Terminal (spanning full width across 2 columns) -->
-        <div class="chart-card" style="grid-column: span 2; display:flex; flex-direction:column;">
-          <div class="chart-title">Serial Terminal</div>
-          <textarea readonly class="terminal-output" ref="terminalOutput" :value="terminalText" style="flex:1; width:100%; height:200px; background:#1e293b; color:#10b981; font-family:monospace; padding:10px; border-radius:5px; border:1px solid #334155; margin-bottom:10px; resize:none;"></textarea>
-          <div style="display:flex; gap:10px;">
-            <input type="text" v-model.lazy="cmdInput" @keyup.enter="sendSerialCommand" style="flex:1; padding:10px; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:5px; font-family:monospace;" placeholder="Type command (e.g. s300, $?) and press Enter...">
-            <button class="file-upload-btn" @click="sendSerialCommand">Send</button>
-            <button class="file-upload-btn" style="background:#334155" @click="terminalText = ''">Clear</button>
           </div>
         </div>
       </div>
@@ -285,8 +320,22 @@ const appendToTerminal = (text) => {
   })
 }
 
+const sendQuickCli = async (cmdStr) => {
+  if (!isSerialConnected.value) {
+    appendToTerminal("[CLI] Warning: Serial USB belum terhubung. Perintah '" + cmdStr + "' disalin ke baris input.")
+    cmdInput.value = cmdStr
+    return
+  }
+  cmdInput.value = cmdStr
+  await sendSerialCommand()
+}
+
 const sendSerialCommand = async () => {
-  if (!serialWriter || !cmdInput.value) return
+  if (!cmdInput.value) return
+  if (!serialWriter) {
+    appendToTerminal("[CLI] Warning: Serial USB belum terhubung!")
+    return
+  }
   try {
     const cmd = cmdInput.value + "\n"
     appendToTerminal("> " + cmdInput.value)
@@ -295,6 +344,7 @@ const sendSerialCommand = async () => {
     cmdInput.value = ""
   } catch (err) {
     console.error(err)
+    appendToTerminal("[CLI] Error sending command: " + err.message)
   }
 }
 
@@ -686,6 +736,196 @@ const toggleRecording = () => {
 </script>
 
 <style scoped>
+.motor-dashboard-layout {
+  display: grid;
+  grid-template-columns: minmax(380px, 32%) 1fr;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  height: calc(100vh - 75px);
+  overflow: hidden;
+}
+
+/* Sisi Kiri: Serial Terminal Card (Full-Height) */
+.motor-terminal-card {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  padding: 12px 14px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+}
+
+.terminal-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.connection-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.connection-pill.connected {
+  background: rgba(16, 185, 129, 0.15);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+.connection-pill.offline {
+  background: rgba(148, 163, 184, 0.1);
+  color: #94a3b8;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: currentColor;
+}
+
+.quick-cli-container {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.quick-cli-btn {
+  background: #0f172a;
+  border: 1px solid #334155;
+  color: #38bdf8;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: 'Fira Code', 'Consolas', monospace;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.quick-cli-btn:hover {
+  background: #1e293b;
+  border-color: #38bdf8;
+  color: #fff;
+}
+
+.quick-cli-btn.stop-btn {
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.4);
+}
+
+.quick-cli-btn.stop-btn:hover {
+  background: rgba(239, 68, 68, 0.2);
+  border-color: #ef4444;
+  color: #fca5a5;
+}
+
+.terminal-output {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  background: #090d16;
+  color: #10b981;
+  font-family: 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  margin-bottom: 10px;
+  resize: none;
+  overflow-y: auto;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.35);
+}
+
+.terminal-input-bar {
+  display: flex;
+  gap: 8px;
+}
+
+.terminal-input-field {
+  flex: 1;
+  padding: 8px 12px;
+  background: #090d16;
+  color: #fff;
+  border: 1px solid #334155;
+  border-radius: 5px;
+  font-family: 'Fira Code', 'Consolas', monospace;
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.terminal-input-field:focus {
+  border-color: #38bdf8;
+}
+
+.send-btn {
+  padding: 7px 16px;
+  font-size: 13px;
+}
+
+.clear-btn {
+  background: #334155;
+  color: #cbd5e1;
+  padding: 7px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  border: none;
+  border-radius: 4px;
+  font-weight: 600;
+  transition: opacity 0.2s;
+}
+
+.clear-btn:hover {
+  background: #475569;
+  color: #fff;
+}
+
+/* Sisi Kanan: 4 Grafik (2 Kolom x 2 Baris) */
+.motor-charts-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 10px;
+  height: 100%;
+  min-height: 0;
+}
+
+.chart-cell {
+  display: flex;
+  flex-direction: row;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  min-height: 0;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.axis-panel {
+  width: 85px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11px;
+  color: #94a3b8;
+}
+
 .axis-input {
   width: 100%;
   padding: 4px;
@@ -694,12 +934,89 @@ const toggleRecording = () => {
   border: 1px solid #334155;
   color: #fff;
   margin-top: 2px;
+  font-family: monospace;
 }
+
 .chart-title {
-  font-size: 1rem;
+  font-size: 0.95rem;
   font-weight: 600;
   color: #f1f5f9;
-  margin-bottom: 10px;
+  margin-bottom: 6px;
+}
+
+@media (max-width: 900px) {
+  .motor-dashboard-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    height: auto !important;
+    min-height: auto !important;
+    overflow: visible !important;
+  }
+  .motor-terminal-card {
+    height: 390px;
+    min-height: 390px;
+    padding: 10px 12px;
+  }
+  .quick-cli-container {
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+  .quick-cli-btn {
+    padding: 4px 7px;
+    font-size: 10.5px;
+    white-space: nowrap;
+  }
+  .terminal-output {
+    min-height: 180px;
+    font-size: 11px;
+    padding: 8px;
+  }
+  .terminal-input-bar {
+    gap: 6px;
+  }
+  .terminal-input-field {
+    padding: 6px 10px;
+    font-size: 12px;
+  }
+  .send-btn, .clear-btn {
+    padding: 6px 12px;
+    font-size: 12px;
+  }
+  .motor-charts-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    height: auto !important;
+    min-height: auto !important;
+  }
+  .chart-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    padding: 10px 12px;
+    height: auto;
+    min-height: 310px;
+  }
+  .chart-cell > div:first-child {
+    width: 100%;
+    min-width: 0;
+  }
+  .axis-panel {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(51, 65, 85, 0.4);
+  }
+}
+
+@media (max-width: 480px) {
+  .axis-panel {
+    grid-template-columns: repeat(2, 1fr);
+  }
 }
 
 :deep(.apexcharts-toolbar) {

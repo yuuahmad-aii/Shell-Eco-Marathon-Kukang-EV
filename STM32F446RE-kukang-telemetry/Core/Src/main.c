@@ -123,8 +123,153 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
   }
 }
 
+// ==============================================================================
+// WHEEL SPEED DIGITAL FILTER & MOVING AVERAGE ALGORITHM (PA0 & PA1)
+// ==============================================================================
+// 1. Hardware Input Filter: TIM2_CH1 & TIM5_CH2 configured with ICFilter = 0x0F
+//    (rejects electrical EMI / MOSFET switching pulses < 3 microseconds).
+// 2. Glitch / Outlier Rejection: Ignores implausibly high speeds (> 100 km/h)
+//    caused by contact bounce or noise spikes.
+// 3. Circular Buffer Moving Average (SMA): Filters sensor misalignment and
+// jitter
+//    in O(1) time without blocking or consuming measurable CPU overhead.
+// 4. Deceleration Clamping & Smooth Timeout: Extrapolates deceleration so the
+//    reading ramps down smoothly when coasting/stopping instead of freezing.
+// ==============================================================================
+#define SPEED_FILTER_SIZE 6            // Moving average window (6 samples)
+#define SPEED_MAX_PLAUSIBLE_KMH 100.0f // Plausible speed ceiling for EV (km/h)
+#define RPM_MAX_PLAUSIBLE 2000.0f      // Plausible RPM ceiling
+
+typedef struct {
+  float buffer[SPEED_FILTER_SIZE];
+  float sum;
+  uint8_t index;
+  uint8_t count;
+  float filtered;
+} SpeedFilter_t;
+
+static SpeedFilter_t filter_speed_left = {0};
+static SpeedFilter_t filter_speed_right = {0};
+static SpeedFilter_t filter_rpm_left = {0};
+static SpeedFilter_t filter_rpm_right = {0};
+
+static volatile uint32_t last_valid_pulse_left = 0;
+static volatile uint32_t last_valid_pulse_right = 0;
+
+static void SpeedFilter_Reset(SpeedFilter_t *f) {
+  for (int i = 0; i < SPEED_FILTER_SIZE; i++) {
+    f->buffer[i] = 0.0f;
+  }
+  f->sum = 0.0f;
+  f->index = 0;
+  f->count = 0;
+  f->filtered = 0.0f;
+}
+
+static void SpeedFilter_Init(void) {
+  SpeedFilter_Reset(&filter_speed_left);
+  SpeedFilter_Reset(&filter_speed_right);
+  SpeedFilter_Reset(&filter_rpm_left);
+  SpeedFilter_Reset(&filter_rpm_right);
+  last_valid_pulse_left = 0;
+  last_valid_pulse_right = 0;
+}
+
+static inline float SpeedFilter_Update(SpeedFilter_t *f, float new_val,
+                                       float max_plausible) {
+  // Reject noise spikes / impossible readings
+  if (new_val < 0.0f || (max_plausible > 0.0f && new_val > max_plausible)) {
+    return f->filtered;
+  }
+
+  // Circular moving average in O(1) time
+  f->sum -= f->buffer[f->index];
+  f->buffer[f->index] = new_val;
+  f->sum += new_val;
+
+  f->index++;
+  if (f->index >= SPEED_FILTER_SIZE) {
+    f->index = 0;
+  }
+  if (f->count < SPEED_FILTER_SIZE) {
+    f->count++;
+  }
+
+  f->filtered = f->sum / (float)f->count;
+  return f->filtered;
+}
+
+static void SpeedFilter_ProcessTimeout(uint32_t current_tick) {
+  Speed_UpdateTimeout();
+
+  // Deceleration tracking & smooth decay for Left Wheel (PA1 / TIM5 CH2)
+  if (last_valid_pulse_left > 0) {
+    uint32_t dt_left = current_tick - last_valid_pulse_left;
+    if (dt_left >= 2000 || speed_left_kmh == 0.0f) {
+      speed_left_kmh = 0.0f;
+      rpm_tim5ch2 = 0.0f;
+      SpeedFilter_Reset(&filter_speed_left);
+      SpeedFilter_Reset(&filter_rpm_left);
+    } else if (dt_left > 300 && current_config.wheel_diameter_mm > 0.0f &&
+               current_config.pulses_per_rev > 0.0f) {
+      float max_possible_kmh =
+          (M_PI * current_config.wheel_diameter_mm * 3600.0f) /
+          ((float)dt_left * current_config.pulses_per_rev * 1000.0f);
+      if (speed_left_kmh > max_possible_kmh) {
+        speed_left_kmh = max_possible_kmh;
+        rpm_tim5ch2 = (speed_left_kmh * 1000000.0f) /
+                      (M_PI * current_config.wheel_diameter_mm * 60.0f);
+        filter_speed_left.filtered = speed_left_kmh;
+        filter_rpm_left.filtered = rpm_tim5ch2;
+      }
+    }
+  }
+
+  // Deceleration tracking & smooth decay for Right Wheel (PA0 / TIM2 CH1)
+  if (last_valid_pulse_right > 0) {
+    uint32_t dt_right = current_tick - last_valid_pulse_right;
+    if (dt_right >= 2000 || speed_right_kmh == 0.0f) {
+      speed_right_kmh = 0.0f;
+      rpm_tim2ch1 = 0.0f;
+      SpeedFilter_Reset(&filter_speed_right);
+      SpeedFilter_Reset(&filter_rpm_right);
+    } else if (dt_right > 300 && current_config.wheel_diameter_mm > 0.0f &&
+               current_config.pulses_per_rev > 0.0f) {
+      float max_possible_kmh =
+          (M_PI * current_config.wheel_diameter_mm * 3600.0f) /
+          ((float)dt_right * current_config.pulses_per_rev * 1000.0f);
+      if (speed_right_kmh > max_possible_kmh) {
+        speed_right_kmh = max_possible_kmh;
+        rpm_tim2ch1 = (speed_right_kmh * 1000000.0f) /
+                      (M_PI * current_config.wheel_diameter_mm * 60.0f);
+        filter_speed_right.filtered = speed_right_kmh;
+        filter_rpm_right.filtered = rpm_tim2ch1;
+      }
+    }
+  }
+}
+
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
   Speed_IC_Callback(htim);
+
+  uint32_t now = HAL_GetTick();
+
+  if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
+    // Right wheel: PA0
+    speed_right_kmh = SpeedFilter_Update(&filter_speed_right, speed_right_kmh,
+                                         SPEED_MAX_PLAUSIBLE_KMH);
+    rpm_tim2ch1 =
+        SpeedFilter_Update(&filter_rpm_right, rpm_tim2ch1, RPM_MAX_PLAUSIBLE);
+    last_valid_pulse_right = now;
+  } else if (htim->Instance == TIM5 &&
+             htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
+    // Left wheel: PA1
+    speed_left_kmh = SpeedFilter_Update(&filter_speed_left, speed_left_kmh,
+                                        SPEED_MAX_PLAUSIBLE_KMH);
+    rpm_tim5ch2 =
+        SpeedFilter_Update(&filter_rpm_left, rpm_tim5ch2, RPM_MAX_PLAUSIBLE);
+    last_valid_pulse_left = now;
+  }
 }
 
 #define MOTOR_DEFAULT_RPM 1000
@@ -250,6 +395,7 @@ int main(void) {
   Config_Init();
   CLI_Init();
   Speed_Init();
+  SpeedFilter_Init();
 
   uint8_t last_raw_buttons = 0;
   uint8_t debounced_buttons = 0;
@@ -264,8 +410,9 @@ int main(void) {
   uint32_t btn3_hold_time = 0;
   uint32_t last_btn_repeat = 0;
 
-  uint8_t display_mode = 0; // 0=Set RPM, 1=Accel/Gyro, 2=Temp/Baro, 3=GPS, 4=Motor/Efficiency
-  uint8_t sub_mode = 0;     // Sub-mode for current display_mode
+  uint8_t display_mode =
+      0; // 0=Set RPM, 1=Accel/Gyro, 2=Temp/Baro, 3=GPS, 4=Motor/Efficiency
+  uint8_t sub_mode = 0; // Sub-mode for current display_mode
 
   float accumulated_distance_km = 0.0f;
   float accumulated_energy_ws = 0.0f;
@@ -330,6 +477,7 @@ int main(void) {
     CLI_Task();
 
     uint32_t current_tick = HAL_GetTick();
+    SpeedFilter_ProcessTimeout(current_tick);
 
     // --- DS18B20 Periodic Search Retry (if < 2 sensors detected) ---
     static uint32_t last_ds18b20_search = 0;
@@ -368,23 +516,36 @@ int main(void) {
         // Calculate Wheel RPM & Temperature with robust fallbacks
         float log_r1 = rpm_tim2ch1;
         float log_r2 = rpm_tim5ch2;
-        if (log_r1 <= 0.0f && speed_right_kmh > 0.0f && current_config.wheel_diameter_mm > 0.0f) {
-          log_r1 = (speed_right_kmh * 1000000.0f) / (M_PI * current_config.wheel_diameter_mm * 60.0f);
+        if (log_r1 <= 0.0f && speed_right_kmh > 0.0f &&
+            current_config.wheel_diameter_mm > 0.0f) {
+          log_r1 = (speed_right_kmh * 1000000.0f) /
+                   (M_PI * current_config.wheel_diameter_mm * 60.0f);
         }
-        if (log_r2 <= 0.0f && speed_left_kmh > 0.0f && current_config.wheel_diameter_mm > 0.0f) {
-          log_r2 = (speed_left_kmh * 1000000.0f) / (M_PI * current_config.wheel_diameter_mm * 60.0f);
+        if (log_r2 <= 0.0f && speed_left_kmh > 0.0f &&
+            current_config.wheel_diameter_mm > 0.0f) {
+          log_r2 = (speed_left_kmh * 1000000.0f) /
+                   (M_PI * current_config.wheel_diameter_mm * 60.0f);
         }
 
         float log_t1 = 0.0f;
         float log_t2 = 0.0f;
         if (num_ds18b20 >= 2) {
-          log_t1 = (ds18b20_devs[0].temperature > -50.0f && ds18b20_devs[0].temperature < 125.0f && ds18b20_devs[0].temperature != 0.0f)
-                  ? ds18b20_devs[0].temperature : bmp_data.temperature;
-          log_t2 = (ds18b20_devs[1].temperature > -50.0f && ds18b20_devs[1].temperature < 125.0f && ds18b20_devs[1].temperature != 0.0f)
-                  ? ds18b20_devs[1].temperature : bmp_data.temperature;
+          log_t1 = (ds18b20_devs[0].temperature > -50.0f &&
+                    ds18b20_devs[0].temperature < 125.0f &&
+                    ds18b20_devs[0].temperature != 0.0f)
+                       ? ds18b20_devs[0].temperature
+                       : bmp_data.temperature;
+          log_t2 = (ds18b20_devs[1].temperature > -50.0f &&
+                    ds18b20_devs[1].temperature < 125.0f &&
+                    ds18b20_devs[1].temperature != 0.0f)
+                       ? ds18b20_devs[1].temperature
+                       : bmp_data.temperature;
         } else if (num_ds18b20 == 1) {
-          log_t1 = (ds18b20_devs[0].temperature > -50.0f && ds18b20_devs[0].temperature < 125.0f && ds18b20_devs[0].temperature != 0.0f)
-                  ? ds18b20_devs[0].temperature : bmp_data.temperature;
+          log_t1 = (ds18b20_devs[0].temperature > -50.0f &&
+                    ds18b20_devs[0].temperature < 125.0f &&
+                    ds18b20_devs[0].temperature != 0.0f)
+                       ? ds18b20_devs[0].temperature
+                       : bmp_data.temperature;
           log_t2 = bmp_data.temperature;
         } else {
           log_t1 = bmp_data.temperature;
@@ -439,14 +600,16 @@ int main(void) {
           if (f_mount(&SDFatFS, SDPath, 1) == FR_OK) {
             if (f_open(&SDFile, current_filename, FA_OPEN_APPEND | FA_WRITE) ==
                 FR_OK) {
-              // Enforce alignment to sizeof(LogData) so fptr never shifts off record boundaries
+              // Enforce alignment to sizeof(LogData) so fptr never shifts off
+              // record boundaries
               FSIZE_t cur_sz = f_size(&SDFile);
               FSIZE_t aligned_sz = (cur_sz / sizeof(LogData)) * sizeof(LogData);
               if (cur_sz != aligned_sz) {
                 f_lseek(&SDFile, aligned_sz);
               }
               last_sync_tick = HAL_GetTick();
-              CLI_Print("SD Recovered (Aligned to %lu)!\r\n", (uint32_t)aligned_sz);
+              CLI_Print("SD Recovered (Aligned to %lu)!\r\n",
+                        (uint32_t)aligned_sz);
               sd_error = 0;
             } else {
               is_logging = 0; // Fatal error, stop logging
@@ -471,12 +634,14 @@ int main(void) {
               if (f_open(&SDFile, current_filename,
                          FA_OPEN_APPEND | FA_WRITE) == FR_OK) {
                 FSIZE_t cur_sz = f_size(&SDFile);
-                FSIZE_t aligned_sz = (cur_sz / sizeof(LogData)) * sizeof(LogData);
+                FSIZE_t aligned_sz =
+                    (cur_sz / sizeof(LogData)) * sizeof(LogData);
                 if (cur_sz != aligned_sz) {
                   f_lseek(&SDFile, aligned_sz);
                 }
                 last_sync_tick = HAL_GetTick();
-                CLI_Print("SD Recovered (Aligned to %lu)!\r\n", (uint32_t)aligned_sz);
+                CLI_Print("SD Recovered (Aligned to %lu)!\r\n",
+                          (uint32_t)aligned_sz);
                 sd_error = 0;
               } else {
                 is_logging = 0;
@@ -496,7 +661,8 @@ int main(void) {
 
       // 1. Read and Debounce TM1638 Buttons
       uint8_t raw_buttons = TM1638_ReadButtons();
-      // Require 2 consecutive matching 50ms samples to eliminate bounce/glitches
+      // Require 2 consecutive matching 50ms samples to eliminate
+      // bounce/glitches
       if (raw_buttons == last_raw_buttons) {
         debounced_buttons = raw_buttons;
       }
@@ -512,7 +678,8 @@ int main(void) {
       if (throttle_active) {
         CAN_SendMotorControl(1, motor_target_rpm);
       } else if (released_edges & 0x01) {
-        // Throttle just released: return display to Set RPM and send stop packets
+        // Throttle just released: return display to Set RPM and send stop
+        // packets
         display_mode = 0;
         CAN_SendMotorControl(0, 0);
         stop_packets_remaining = 3;
@@ -522,7 +689,8 @@ int main(void) {
       }
 
       // Button 2 (S2 = 0x02): Speed Down (Decrement target speed)
-      if ((pressed_edges & 0x02) && (current_tick - last_btn_action_tick[1] >= 200)) {
+      if ((pressed_edges & 0x02) &&
+          (current_tick - last_btn_action_tick[1] >= 200)) {
         last_btn_action_tick[1] = current_tick;
         if (motor_target_rpm >= (MOTOR_RPM_MIN + MOTOR_RPM_STEP)) {
           motor_target_rpm -= MOTOR_RPM_STEP;
@@ -531,7 +699,8 @@ int main(void) {
         }
         display_mode = 0; // Switch to Set RPM display
         btn2_hold_time = current_tick;
-      } else if ((debounced_buttons & 0x02) && (current_tick - btn2_hold_time > 400) &&
+      } else if ((debounced_buttons & 0x02) &&
+                 (current_tick - btn2_hold_time > 400) &&
                  (current_tick - last_btn_repeat > 100)) {
         if (motor_target_rpm >= (MOTOR_RPM_MIN + MOTOR_RPM_STEP)) {
           motor_target_rpm -= MOTOR_RPM_STEP;
@@ -543,7 +712,8 @@ int main(void) {
       }
 
       // Button 3 (S3 = 0x04): Speed Up (Increment target speed)
-      if ((pressed_edges & 0x04) && (current_tick - last_btn_action_tick[2] >= 200)) {
+      if ((pressed_edges & 0x04) &&
+          (current_tick - last_btn_action_tick[2] >= 200)) {
         last_btn_action_tick[2] = current_tick;
         if (motor_target_rpm + MOTOR_RPM_STEP <= MOTOR_RPM_MAX) {
           motor_target_rpm += MOTOR_RPM_STEP;
@@ -552,7 +722,8 @@ int main(void) {
         }
         display_mode = 0; // Switch to Set RPM display
         btn3_hold_time = current_tick;
-      } else if ((debounced_buttons & 0x04) && (current_tick - btn3_hold_time > 400) &&
+      } else if ((debounced_buttons & 0x04) &&
+                 (current_tick - btn3_hold_time > 400) &&
                  (current_tick - last_btn_repeat > 100)) {
         if (motor_target_rpm + MOTOR_RPM_STEP <= MOTOR_RPM_MAX) {
           motor_target_rpm += MOTOR_RPM_STEP;
@@ -564,7 +735,8 @@ int main(void) {
       }
 
       // Button 8 (S8 = 0x80): Accel & Gyro
-      if ((pressed_edges & 0x80) && (current_tick - last_btn_action_tick[7] >= 250)) {
+      if ((pressed_edges & 0x80) &&
+          (current_tick - last_btn_action_tick[7] >= 250)) {
         last_btn_action_tick[7] = current_tick;
         if (display_mode == 1)
           sub_mode = (sub_mode + 1) % 6;
@@ -575,7 +747,8 @@ int main(void) {
       }
 
       // Button 7 (S7 = 0x40): Temperatures and Barometer
-      if ((pressed_edges & 0x40) && (current_tick - last_btn_action_tick[6] >= 250)) {
+      if ((pressed_edges & 0x40) &&
+          (current_tick - last_btn_action_tick[6] >= 250)) {
         last_btn_action_tick[6] = current_tick;
         if (display_mode == 2)
           sub_mode = (sub_mode + 1) % (2 + num_ds18b20);
@@ -586,7 +759,8 @@ int main(void) {
       }
 
       // Button 6 (S6 = 0x20): GPS
-      if ((pressed_edges & 0x20) && (current_tick - last_btn_action_tick[5] >= 250)) {
+      if ((pressed_edges & 0x20) &&
+          (current_tick - last_btn_action_tick[5] >= 250)) {
         last_btn_action_tick[5] = current_tick;
         if (display_mode == 3)
           sub_mode = (sub_mode + 1) % 6; // Lat, Lon, Sats, Fix, PDOP, Alt
@@ -596,8 +770,10 @@ int main(void) {
         }
       }
 
-      // Button 5 (S5 = 0x10): Logging Start / Stop (400ms lockout prevents chatter restart)
-      if ((pressed_edges & 0x10) && (current_tick - last_btn_action_tick[4] >= 400)) {
+      // Button 5 (S5 = 0x10): Logging Start / Stop (400ms lockout prevents
+      // chatter restart)
+      if ((pressed_edges & 0x10) &&
+          (current_tick - last_btn_action_tick[4] >= 400)) {
         last_btn_action_tick[4] = current_tick;
         if (is_logging || sd_error) {
           f_close(&SDFile);
@@ -618,7 +794,8 @@ int main(void) {
                 sd_error = 0;
                 log_start_time = HAL_GetTick();
                 last_log_tick = log_start_time; // Reset log tick
-                last_sync_tick = log_start_time; // Reset sync tick to prevent premature sync
+                last_sync_tick =
+                    log_start_time; // Reset sync tick to prevent premature sync
 
                 // Reset distance and energy baseline at start line
                 accumulated_distance_km = 0.0f;
@@ -627,7 +804,8 @@ int main(void) {
                 km_per_kwh = 0.0f;
                 last_energy_tick = log_start_time;
 
-                CLI_Print("Log started: %s (Baseline Reset)\r\n", current_filename);
+                CLI_Print("Log started: %s (Baseline Reset)\r\n",
+                          current_filename);
                 break;
               }
               file_index++;
@@ -643,8 +821,10 @@ int main(void) {
         }
       }
 
-      // Button 4 (S4 = 0x08): Motor Telemetry & Efficiency (Vbus, Iq, Watt, RPM1, RPM2, km/kWh)
-      if ((pressed_edges & 0x08) && (current_tick - last_btn_action_tick[3] >= 250)) {
+      // Button 4 (S4 = 0x08): Motor Telemetry & Efficiency (Vbus, Iq, Watt,
+      // RPM1, RPM2, km/kWh)
+      if ((pressed_edges & 0x08) &&
+          (current_tick - last_btn_action_tick[3] >= 250)) {
         last_btn_action_tick[3] = current_tick;
         if (display_mode == 4)
           sub_mode = (sub_mode + 1) % 6;
@@ -661,7 +841,8 @@ int main(void) {
       BMP280_ReadSensor(&hspi1, &bmp_data);
       GPS_GetLatestData(&gps_data); // Gets latest parsed data
 
-      // 3. Distance and Energy Accumulation (since start line / Button 5 logging)
+      // 3. Distance and Energy Accumulation (since start line / Button 5
+      // logging)
       if (last_energy_tick == 0) {
         last_energy_tick = current_tick;
       }
@@ -693,7 +874,7 @@ int main(void) {
       // 4. Display Logic
       uint8_t led_mask = 0;
 
-      Speed_UpdateTimeout();
+      SpeedFilter_ProcessTimeout(current_tick);
       // Coast strategy warning
       float avg_speed = (speed_left_kmh + speed_right_kmh) / 2.0f;
       if (avg_speed > 0 && avg_speed < current_config.coast_speed_min) {
@@ -769,7 +950,7 @@ int main(void) {
           }
           break;
 
-        case 4: // Motor Telemetry & Efficiency (Button 4)
+        case 4:                     // Motor Telemetry & Efficiency (Button 4)
           led_mask = 1 << sub_mode; // LED 1 to 6
           if (sub_mode == 0) {
             // DC Bus Voltage (V)
@@ -811,17 +992,27 @@ int main(void) {
     if (current_tick - last_telemetry_tick >= 500) {
       last_telemetry_tick = current_tick;
 
-      // Temperature fallback: prioritize DS18B20; fallback to BMP280 temperature if DS18B20 is unavailable or invalid
+      // Temperature fallback: prioritize DS18B20; fallback to BMP280
+      // temperature if DS18B20 is unavailable or invalid
       float temp1 = 0.0f;
       float temp2 = 0.0f;
       if (num_ds18b20 >= 2) {
-        temp1 = (ds18b20_devs[0].temperature > -50.0f && ds18b20_devs[0].temperature < 125.0f && ds18b20_devs[0].temperature != 0.0f)
-                ? ds18b20_devs[0].temperature : bmp_data.temperature;
-        temp2 = (ds18b20_devs[1].temperature > -50.0f && ds18b20_devs[1].temperature < 125.0f && ds18b20_devs[1].temperature != 0.0f)
-                ? ds18b20_devs[1].temperature : bmp_data.temperature;
+        temp1 = (ds18b20_devs[0].temperature > -50.0f &&
+                 ds18b20_devs[0].temperature < 125.0f &&
+                 ds18b20_devs[0].temperature != 0.0f)
+                    ? ds18b20_devs[0].temperature
+                    : bmp_data.temperature;
+        temp2 = (ds18b20_devs[1].temperature > -50.0f &&
+                 ds18b20_devs[1].temperature < 125.0f &&
+                 ds18b20_devs[1].temperature != 0.0f)
+                    ? ds18b20_devs[1].temperature
+                    : bmp_data.temperature;
       } else if (num_ds18b20 == 1) {
-        temp1 = (ds18b20_devs[0].temperature > -50.0f && ds18b20_devs[0].temperature < 125.0f && ds18b20_devs[0].temperature != 0.0f)
-                ? ds18b20_devs[0].temperature : bmp_data.temperature;
+        temp1 = (ds18b20_devs[0].temperature > -50.0f &&
+                 ds18b20_devs[0].temperature < 125.0f &&
+                 ds18b20_devs[0].temperature != 0.0f)
+                    ? ds18b20_devs[0].temperature
+                    : bmp_data.temperature;
         temp2 = bmp_data.temperature;
       } else {
         temp1 = bmp_data.temperature;
@@ -829,14 +1020,19 @@ int main(void) {
       }
 
       // Wheel RPM fallback: TIM2 is Right Wheel, TIM5 is Left Wheel.
-      // If RPM is 0 while wheel speed is non-zero, calculate RPM directly from speed to prevent zero RPM in telemetry
+      // If RPM is 0 while wheel speed is non-zero, calculate RPM directly from
+      // speed to prevent zero RPM in telemetry
       float r1 = rpm_tim2ch1;
       float r2 = rpm_tim5ch2;
-      if (r1 <= 0.0f && speed_right_kmh > 0.0f && current_config.wheel_diameter_mm > 0.0f) {
-        r1 = (speed_right_kmh * 1000000.0f) / (M_PI * current_config.wheel_diameter_mm * 60.0f);
+      if (r1 <= 0.0f && speed_right_kmh > 0.0f &&
+          current_config.wheel_diameter_mm > 0.0f) {
+        r1 = (speed_right_kmh * 1000000.0f) /
+             (M_PI * current_config.wheel_diameter_mm * 60.0f);
       }
-      if (r2 <= 0.0f && speed_left_kmh > 0.0f && current_config.wheel_diameter_mm > 0.0f) {
-        r2 = (speed_left_kmh * 1000000.0f) / (M_PI * current_config.wheel_diameter_mm * 60.0f);
+      if (r2 <= 0.0f && speed_left_kmh > 0.0f &&
+          current_config.wheel_diameter_mm > 0.0f) {
+        r2 = (speed_left_kmh * 1000000.0f) /
+             (M_PI * current_config.wheel_diameter_mm * 60.0f);
       }
 
       static char tele_buf[512];
@@ -853,35 +1049,19 @@ int main(void) {
           "\"vbus\":%.2f,\"iq\":%.2f,"
           "\"r1\":%.0f,\"r2\":%.0f,"
           "\"t1\":%.2f,\"t2\":%.2f}\n",
-          (unsigned long)current_tick,
-          (unsigned int)gps_data.year,
-          (unsigned int)gps_data.month,
-          (unsigned int)gps_data.day,
-          (unsigned int)gps_data.hour,
-          (unsigned int)gps_data.min,
-          (unsigned int)gps_data.sec,
-          (unsigned int)gps_data.is_time_valid,
-          (double)imu_data.accel_x,
-          (double)imu_data.accel_y,
-          (double)imu_data.accel_z,
-          (double)imu_data.gyro_x,
-          (double)imu_data.gyro_y,
-          (double)imu_data.gyro_z,
-          (double)bmp_data.altitude,
-          (double)gps_data.latitude,
-          (double)gps_data.longitude,
-          (double)gps_data.gps_altitude,
-          (double)gps_data.pdop,
-          (unsigned int)gps_data.fix_type,
-          (unsigned int)gps_data.num_satellites,
-          (double)speed_left_kmh,
-          (double)speed_right_kmh,
-          (double)can_vbus,
-          (double)can_actual_iq,
-          (double)r1,
-          (double)r2,
-          (double)temp1,
-          (double)temp2);
+          (unsigned long)current_tick, (unsigned int)gps_data.year,
+          (unsigned int)gps_data.month, (unsigned int)gps_data.day,
+          (unsigned int)gps_data.hour, (unsigned int)gps_data.min,
+          (unsigned int)gps_data.sec, (unsigned int)gps_data.is_time_valid,
+          (double)imu_data.accel_x, (double)imu_data.accel_y,
+          (double)imu_data.accel_z, (double)imu_data.gyro_x,
+          (double)imu_data.gyro_y, (double)imu_data.gyro_z,
+          (double)bmp_data.altitude, (double)gps_data.latitude,
+          (double)gps_data.longitude, (double)gps_data.gps_altitude,
+          (double)gps_data.pdop, (unsigned int)gps_data.fix_type,
+          (unsigned int)gps_data.num_satellites, (double)speed_left_kmh,
+          (double)speed_right_kmh, (double)can_vbus, (double)can_actual_iq,
+          (double)r1, (double)r2, (double)temp1, (double)temp2);
 
       if (len > 0 && len < sizeof(tele_buf)) {
         // Use IT (Interrupt) to prevent blocking the main loop
@@ -1173,12 +1353,32 @@ static void MX_TIM2_Init(void) {
   sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
   sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
   sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
+  sConfigIC.ICFilter = 0x0F;
   if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_1) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN TIM2_Init 2 */
-
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 4294967295;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_IC_Init(&htim2) != HAL_OK) {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0x0F;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_1) != HAL_OK) {
+    Error_Handler();
+  }
   /* USER CODE END TIM2_Init 2 */
 }
 
@@ -1216,12 +1416,32 @@ static void MX_TIM5_Init(void) {
   sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
   sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
   sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
+  sConfigIC.ICFilter = 0x0F;
   if (HAL_TIM_IC_ConfigChannel(&htim5, &sConfigIC, TIM_CHANNEL_2) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN TIM5_Init 2 */
-
+  htim5.Instance = TIM5;
+  htim5.Init.Prescaler = 0;
+  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim5.Init.Period = 4294967295;
+  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_IC_Init(&htim5) != HAL_OK) {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK) {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0x0F;
+  if (HAL_TIM_IC_ConfigChannel(&htim5, &sConfigIC, TIM_CHANNEL_2) != HAL_OK) {
+    Error_Handler();
+  }
   /* USER CODE END TIM5_Init 2 */
 }
 

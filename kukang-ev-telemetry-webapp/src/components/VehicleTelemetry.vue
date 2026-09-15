@@ -34,7 +34,7 @@
     </Teleport>
 
     <!-- VEHICLE TELEMETRY -->
-    <main class="dashboard-grid" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);">
+    <main class="dashboard-grid vehicle-dashboard-layout">
 
       <!-- Left Column: Map & Serial Terminal (50% Width) -->
       <div class="map-column">
@@ -1139,7 +1139,7 @@ onMounted(() => {
 
 <style scoped>
 /* Layout 50% / 50% split screen */
-.dashboard-grid {
+.vehicle-dashboard-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 10px;
@@ -1215,5 +1215,65 @@ onMounted(() => {
 .quick-cli-btn:hover {
   background: #334155;
   color: #fff;
+}
+
+/* Mobile & Tablet Responsive (Satu Kolom Banyak Baris) */
+@media (max-width: 900px) {
+  .vehicle-dashboard-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    height: auto !important;
+    min-height: auto !important;
+    overflow: visible !important;
+  }
+  .map-column {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    overflow: visible;
+  }
+  .map-card #leaflet-map {
+    min-height: 280px;
+    height: 280px;
+  }
+  .terminal-card {
+    min-height: 380px;
+    height: 380px;
+  }
+  .charts-column {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    overflow: visible;
+    padding-right: 0;
+  }
+  .chart-with-axis {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    padding: 10px 12px;
+    height: auto;
+    min-height: 310px;
+  }
+  .chart-with-axis > div:first-child {
+    width: 100%;
+    min-width: 0;
+  }
+  .axis-panel {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(51, 65, 85, 0.4);
+  }
+}
+
+@media (max-width: 480px) {
+  .axis-panel {
+    grid-template-columns: repeat(2, 1fr);
+  }
 }
 </style>

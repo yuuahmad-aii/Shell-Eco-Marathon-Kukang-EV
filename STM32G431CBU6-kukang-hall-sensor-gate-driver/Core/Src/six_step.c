@@ -138,47 +138,53 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
             if (last_hall_state != 0 && last_hall_state != hall_state) {
                 int8_t dir = Get_Hall_Direction(hall_state, last_hall_state);
 
-                // Ignore invalid sequence jumps (dir == 0) caused by noise
-                if (dir != 0) {
-                    hall_edge_count++;
+                // Reject invalid sequence jumps (dir == 0) caused by noise/switching glitches
+                // Do NOT accept or commute into an illegal state!
+                if (dir == 0) {
+                    return;
+                }
 
-                    // Minimum plausible tick count for 7 pole-pair motor:
-                    // At 6,000 RPM mechanical (42,000 electrical RPM), 60 deg is 238 us = ~34,000 ticks at 144MHz.
-                    // Reject any capture < 15,000 ticks (~104 us, >13,700 RPM) as electrical switching glitch.
-                    // Also require at least 2 edges so the first edge (from standstill/stall) is not used.
-                    if (hall_edge_count >= 2 && capture >= 15000 && tim2_tick_freq > 0.0f) {
-                        float dt_hall = (float)capture / tim2_tick_freq;
-                        float inst_vel = (float)dir * (M_PI / 3.0f) / dt_hall;
+                hall_edge_count++;
 
-                        // Clamp maximum plausible velocity:
-                        // 2500 rad/s electrical corresponds to ~3400 RPM mechanical for 7 pole pairs.
-                        if (fabsf(inst_vel) <= 2500.0f) {
-                            if (fabsf(electrical_velocity) < 1.0f) {
-                                electrical_velocity = inst_vel;
-                            } else {
-                                // Limit maximum change per Hall step to physical rotor acceleration limits
-                                float max_step_change = fabsf(electrical_velocity) * 0.7f + 50.0f;
-                                float diff = inst_vel - electrical_velocity;
-                                if (diff > max_step_change) inst_vel = electrical_velocity + max_step_change;
-                                if (diff < -max_step_change) inst_vel = electrical_velocity - max_step_change;
+                // Minimum plausible tick count for high pole-count motor:
+                // Reject any capture < 15,000 ticks as electrical switching glitch.
+                // Also require at least 2 edges so the first edge (from standstill/stall) is not used.
+                if (hall_edge_count >= 2 && capture >= 15000 && tim2_tick_freq > 0.0f) {
+                    float dt_hall = (float)capture / tim2_tick_freq;
+                    float inst_vel = (float)dir * (M_PI / 3.0f) / dt_hall;
 
-                                // Filter out mechanical sensor placement asymmetry smoothly
-                                electrical_velocity = 0.2f * inst_vel + 0.8f * electrical_velocity;
-                            }
-                            last_capture_ticks = capture;
+                    // Clamp maximum plausible velocity:
+                    if (fabsf(inst_vel) <= 2500.0f) {
+                        if (fabsf(electrical_velocity) < 1.0f) {
+                            electrical_velocity = inst_vel;
+                        } else {
+                            // Limit maximum change per Hall step to physical rotor acceleration limits
+                            float max_step_change = fabsf(electrical_velocity) * 0.7f + 50.0f;
+                            float diff = inst_vel - electrical_velocity;
+                            if (diff > max_step_change) inst_vel = electrical_velocity + max_step_change;
+                            if (diff < -max_step_change) inst_vel = electrical_velocity - max_step_change;
+
+                            // Filter out mechanical sensor placement asymmetry smoothly
+                            electrical_velocity = 0.2f * inst_vel + 0.8f * electrical_velocity;
                         }
+                        last_capture_ticks = capture;
                     }
                 }
-            }
-            last_hall_state = hall_state;
-            current_hall_state = hall_state;
-            last_hall_tick = now_tick;
 
-            // Zero-latency instant phase commutation on edge in 6-step mode
-            if (motor_running && !svpwm_mode) {
-                uint32_t arr = htim1.Instance->ARR;
-                uint32_t ccr_val = (uint32_t)((fabsf(current_duty) / 100.0f) * arr);
-                SixStep_ApplyCommutation(hall_state, ccr_val);
+                last_hall_state = hall_state;
+                current_hall_state = hall_state;
+                last_hall_tick = now_tick;
+
+                // Zero-latency instant phase commutation on edge in 6-step mode
+                if (motor_running && !svpwm_mode) {
+                    uint32_t arr = htim1.Instance->ARR;
+                    uint32_t ccr_val = (uint32_t)((fabsf(current_duty) / 100.0f) * arr);
+                    SixStep_ApplyCommutation(hall_state, ccr_val);
+                }
+            } else if (last_hall_state == 0) {
+                last_hall_state = hall_state;
+                current_hall_state = hall_state;
+                last_hall_tick = now_tick;
             }
         }
     }
@@ -314,12 +320,14 @@ void SixStep_Stop(void) {
     htim1.Instance->CCR3 = 0;
 }
 
-static uint8_t Get_Hall_State(void) {
-    uint8_t state = 0;
-    if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET) state |= 1;
-    if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_1) == GPIO_PIN_SET) state |= 2;
-    if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_2) == GPIO_PIN_SET) state |= 4;
-    return state;
+static inline uint8_t Get_Hall_State(void) {
+    // Read PA0, PA1, PA2 simultaneously in a single clock cycle to prevent non-atomic transition artifacts
+    uint8_t s1 = (uint8_t)(GPIOA->IDR & 0x07);
+    uint8_t s2 = (uint8_t)(GPIOA->IDR & 0x07);
+    if (s1 == s2) return s1;
+    // Debounce/confirm during high-frequency transience
+    for (volatile int i = 0; i < 5; i++);
+    return (uint8_t)(GPIOA->IDR & 0x07);
 }
 
 static int8_t Get_Hall_Direction(uint8_t current, uint8_t previous) {
@@ -382,10 +390,16 @@ void SixStep_Update(float dt) {
 
     time_running += dt;
 
-    // Elapsed time since last Hall edge obtained directly from TIM2 counter (absolute precision, zero polling jitter)
+    // Atomically sample TIM2 CNT and current_hall_state together to prevent race conditions with the Hall ISR
+    uint32_t prim = __get_PRIMASK();
+    __disable_irq();
+    uint32_t cnt = htim2.Instance->CNT;
+    uint8_t hall_state = current_hall_state;
+    if (!prim) __enable_irq();
+
     float time_since_hall = 0.0f;
     if (tim2_tick_freq > 0.0f) {
-        time_since_hall = (float)htim2.Instance->CNT / tim2_tick_freq;
+        time_since_hall = (float)cnt / tim2_tick_freq;
     }
 
     // Timeout check: if no edge for > 200ms, the motor has stalled or stopped
@@ -393,7 +407,7 @@ void SixStep_Update(float dt) {
         electrical_velocity = 0.0f;
         hall_edge_count = 0;
         time_since_hall = 0.2f;
-    } else if (last_capture_ticks > 0 && htim2.Instance->CNT > (last_capture_ticks * 2)) {
+    } else if (last_capture_ticks > 0 && cnt > (last_capture_ticks * 2)) {
         // Fast deceleration tracking: current step is taking longer than 2x previous step
         float max_possible_vel = (M_PI / 3.0f) / time_since_hall;
         if (electrical_velocity > max_possible_vel) {
@@ -403,7 +417,9 @@ void SixStep_Update(float dt) {
         }
     }
 
-    uint8_t hall_state = current_hall_state;
+    if (hall_state < 1 || hall_state > 6) {
+        hall_state = 5;
+    }
 
     // Calculate expected angle based on Hall sensors
     float hall_offset = motor_config.hall_offset_deg * M_PI / 180.0f;
@@ -414,7 +430,11 @@ void SixStep_Update(float dt) {
         expected_angle += (M_PI / 3.0f);
     }
     
-    expected_angle += (electrical_velocity * time_since_hall);
+    // Limit angle advance within current sector to at most 60 deg (PI/3) to prevent sector overshooting
+    float angle_advance = electrical_velocity * time_since_hall;
+    if (angle_advance > (M_PI / 3.0f)) angle_advance = (M_PI / 3.0f);
+    if (angle_advance < -(M_PI / 3.0f)) angle_advance = -(M_PI / 3.0f);
+    expected_angle += angle_advance;
     
     while (expected_angle > 2.0f * M_PI) expected_angle -= 2.0f * M_PI;
     while (expected_angle < 0.0f) expected_angle += 2.0f * M_PI;

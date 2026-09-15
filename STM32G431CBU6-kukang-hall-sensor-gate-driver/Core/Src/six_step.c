@@ -16,6 +16,8 @@ static float current_duty = 0.0f; // 0.0 to 100.0
 static uint8_t motor_running = 0;
 static volatile uint8_t current_hall_state = 0;
 static volatile uint8_t last_hall_state = 0;
+static volatile uint8_t active_comm_state = 0;
+static volatile uint32_t last_comm_advance_tick = 0;
 static volatile uint32_t last_capture_ticks = 0;
 static volatile uint32_t last_hall_tick = 0;
 static volatile uint8_t hall_edge_count = 0;
@@ -23,6 +25,7 @@ static float tim2_tick_freq = 0.0f;
 
 static uint8_t Get_Hall_State(void);
 static int8_t Get_Hall_Direction(uint8_t current, uint8_t previous);
+static uint8_t SixStep_GetNextHallState(uint8_t state, int8_t dir);
 static void SixStep_ApplyCommutation(uint8_t hall_state, uint32_t ccr_val);
 
 static volatile float electrical_velocity = 0.0f; 
@@ -173,18 +176,22 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
 
                 last_hall_state = hall_state;
                 current_hall_state = hall_state;
+                active_comm_state = hall_state;
                 last_hall_tick = now_tick;
+                last_comm_advance_tick = now_tick;
 
                 // Zero-latency instant phase commutation on edge in 6-step mode
                 if (motor_running && !svpwm_mode) {
                     uint32_t arr = htim1.Instance->ARR;
                     uint32_t ccr_val = (uint32_t)((fabsf(current_duty) / 100.0f) * arr);
-                    SixStep_ApplyCommutation(hall_state, ccr_val);
+                    SixStep_ApplyCommutation(active_comm_state, ccr_val);
                 }
             } else if (last_hall_state == 0) {
                 last_hall_state = hall_state;
                 current_hall_state = hall_state;
+                active_comm_state = hall_state;
                 last_hall_tick = now_tick;
+                last_comm_advance_tick = now_tick;
             }
         }
     }
@@ -195,6 +202,8 @@ void SixStep_Init(void) {
     motor_running = 0;
     current_hall_state = 0;
     last_hall_state = 0;
+    active_comm_state = 0;
+    last_comm_advance_tick = 0;
     last_capture_ticks = 0;
     last_hall_tick = 0;
     hall_edge_count = 0;
@@ -235,8 +244,13 @@ void SixStep_Init(void) {
     HAL_TIMEx_HallSensor_Start_IT(&htim2);
 
     current_hall_state = Get_Hall_State();
+    if (current_hall_state < 1 || current_hall_state > 6) {
+        current_hall_state = 5;
+    }
     last_hall_state = current_hall_state;
+    active_comm_state = current_hall_state;
     last_hall_tick = HAL_GetTick();
+    last_comm_advance_tick = last_hall_tick;
 }
 
 void SixStep_SetRPM(float setpoint_rpm) {
@@ -256,28 +270,15 @@ void SixStep_SetRPM(float setpoint_rpm) {
             // Wait 5ms to fully charge bootstrap capacitors
             HAL_Delay(5);
             
-            // --- SINGLE ALIGNMENT (STARTUP) ---
-            if (motor_config.startup_align_ms > 0) {
-                // Apply a static vector: Phase U high, V low, W float
-                uint32_t align_ccr = (uint32_t)((motor_config.startup_align_duty / 100.0f) * htim1.Instance->ARR);
-                htim1.Instance->CCR1 = align_ccr;
-                htim1.Instance->CCR2 = 0;
-                htim1.Instance->CCR3 = 0;
-                
-                ENABLE_PHASE_U();
-                ENABLE_PHASE_V();
-                DISABLE_PHASE_W();
-                
-                HAL_Delay(motor_config.startup_align_ms);
-            }
-            
             // Disable phases before starting normal commutation
             DISABLE_PHASE_U();
             DISABLE_PHASE_V();
             DISABLE_PHASE_W();
-            // ---------------------------------------
 
             current_hall_state = Get_Hall_State();
+            if (current_hall_state < 1 || current_hall_state > 6) {
+                current_hall_state = 5;
+            }
             last_hall_state = current_hall_state;
             last_hall_tick = HAL_GetTick();
             last_capture_ticks = 0;
@@ -288,10 +289,13 @@ void SixStep_SetRPM(float setpoint_rpm) {
             vel_integral = (target_rpm > 0.0f) ? 10.0f : -10.0f; // Pre-load integral slightly to give initial kick
             current_duty = (target_rpm > 0.0f) ? 10.0f : -10.0f;
 
-            // Apply initial commutation step based on current Hall state
+            // Apply initial commutation step based on active commutation state
+            active_comm_state = current_hall_state;
+            last_comm_advance_tick = HAL_GetTick();
+
             uint32_t arr = htim1.Instance->ARR;
             uint32_t ccr_val = (uint32_t)((fabsf(current_duty) / 100.0f) * arr);
-            SixStep_ApplyCommutation(current_hall_state, ccr_val);
+            SixStep_ApplyCommutation(active_comm_state, ccr_val);
         }
         motor_running = 1;
     } else {
@@ -310,6 +314,8 @@ void SixStep_Stop(void) {
     electrical_velocity = 0.0f;
     last_capture_ticks = 0;
     hall_edge_count = 0;
+    active_comm_state = 0;
+    last_comm_advance_tick = 0;
     
     DISABLE_PHASE_U();
     DISABLE_PHASE_V();
@@ -340,6 +346,32 @@ static int8_t Get_Hall_Direction(uint8_t current, uint8_t previous) {
         case 6: return (current == 4) ? 1 : ((current == 2) ? -1 : 0);
         case 4: return (current == 5) ? 1 : ((current == 6) ? -1 : 0);
         default: return 0;
+    }
+}
+
+static uint8_t SixStep_GetNextHallState(uint8_t state, int8_t dir) {
+    if (dir >= 0) {
+        // Forward sequence: 5 -> 1 -> 3 -> 2 -> 6 -> 4 -> 5
+        switch (state) {
+            case 5: return 1;
+            case 1: return 3;
+            case 3: return 2;
+            case 2: return 6;
+            case 6: return 4;
+            case 4: return 5;
+            default: return 5;
+        }
+    } else {
+        // Reverse sequence: 5 -> 4 -> 6 -> 2 -> 3 -> 1 -> 5
+        switch (state) {
+            case 5: return 4;
+            case 4: return 6;
+            case 6: return 2;
+            case 2: return 3;
+            case 3: return 1;
+            case 1: return 5;
+            default: return 5;
+        }
     }
 }
 
@@ -514,6 +546,23 @@ void SixStep_Update(float dt) {
         current_duty = pi_out;
     }
 
+    // Stuck detection and phase advance:
+    // If motor is running in 6-step mode, but no Hall transition is detected for >40ms
+    // after initial phase injection (or stall), advance commutation to the next step
+    // in sequence to break rotor out of static equilibrium / cogging detent.
+    uint32_t now_tick = HAL_GetTick();
+    if (!svpwm_mode && motor_running && fabsf(target_rpm) > 5.0f) {
+        if (active_comm_state < 1 || active_comm_state > 6) {
+            active_comm_state = (current_hall_state >= 1 && current_hall_state <= 6) ? current_hall_state : 5;
+        }
+        uint8_t is_stuck = (hall_edge_count < 2) || (fabsf(electrical_velocity) < 1.0f && (now_tick - last_hall_tick > 60));
+        if (is_stuck && (now_tick - last_comm_advance_tick >= 40)) {
+            int8_t adv_dir = (target_rpm >= 0.0f) ? 1 : -1;
+            active_comm_state = SixStep_GetNextHallState(active_comm_state, adv_dir);
+            last_comm_advance_tick = now_tick;
+        }
+    }
+
     uint32_t arr = htim1.Instance->ARR;
     uint32_t ccr_val = (uint32_t)((fabsf(current_duty) / 100.0f) * arr);
 
@@ -533,7 +582,7 @@ void SixStep_Update(float dt) {
         htim1.Instance->CCR2 = (uint32_t)(tb * arr);
         htim1.Instance->CCR3 = (uint32_t)(tc * arr);
     } else {
-        SixStep_ApplyCommutation(hall_state, ccr_val);
+        SixStep_ApplyCommutation(active_comm_state, ccr_val);
     }
 }
 
